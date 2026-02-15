@@ -36,7 +36,7 @@ from playwright.async_api import Error as PlaywrightError
 from temporalio.exceptions import ApplicationError
 
 from app.activities.browser import BrowserActivities
-from app.domain.exceptions import BrowserStartError
+from app.domain.exceptions import BrowserNavigationError, BrowserStartError
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +335,1049 @@ class TestStartPlaywrightActivity:
         assert bind_kwargs["run_id"] == mock_info.workflow_run_id
         assert bind_kwargs["activity_id"] == mock_info.activity_id
         assert bind_kwargs["activity_name"] == mock_info.activity_type
+
+
+# ===========================================================================
+# TestNavigateToHackerNewsActivity
+# ===========================================================================
+
+
+class TestNavigateToHackerNewsActivity:
+    """Tests for ``BrowserActivities.navigate_to_hacker_news_activity``.
+
+    ``_ensure_browser`` is patched with ``AsyncMock`` in every test so that
+    the activity's navigation logic is tested in isolation from browser
+    lifecycle management. ``activities._page`` is set directly after patching
+    ``_ensure_browser`` (which would otherwise leave it as ``None``).
+
+    ``_capture_screenshot`` is patched where it would be called so the tests
+    remain hermetic (no real filesystem writes).
+    """
+
+    @pytest.fixture()
+    def activities(self) -> BrowserActivities:
+        return BrowserActivities()
+
+    @pytest.fixture()
+    def mock_info(self) -> MagicMock:
+        return _make_activity_info(
+            activity_type="navigate_to_hacker_news_activity"
+        )
+
+    @pytest.fixture()
+    def mock_page(self) -> AsyncMock:
+        """Success-path mock page: goto returns ok, title is 'Hacker News',
+        wait_for_selector finds story rows."""
+        page = AsyncMock()
+        response = MagicMock()
+        response.ok = True
+        page.goto = AsyncMock(return_value=response)
+        page.title = AsyncMock(return_value="Hacker News")
+        page.wait_for_selector = AsyncMock(return_value=None)
+        return page
+
+    # ------------------------------------------------------------------
+    # Success path
+    # ------------------------------------------------------------------
+
+    async def test_returns_true_on_success(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+        mock_page: AsyncMock,
+    ) -> None:
+        """Activity returns ``True`` when all navigation steps succeed."""
+        activities._page = mock_page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+        ):
+            result = await activities.navigate_to_hacker_news_activity()
+
+        assert result is True
+
+    async def test_calls_ensure_browser_exactly_once(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+        mock_page: AsyncMock,
+    ) -> None:
+        """Activity delegates browser initialisation to _ensure_browser exactly once."""
+        activities._page = mock_page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(
+                activities, "_ensure_browser", new_callable=AsyncMock
+            ) as mock_ensure,
+        ):
+            await activities.navigate_to_hacker_news_activity()
+
+        mock_ensure.assert_awaited_once()
+
+    async def test_logs_starting_event(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+        mock_page: AsyncMock,
+    ) -> None:
+        """Activity emits a 'navigation.starting' log event before navigating."""
+        mock_logger = _make_mock_logger()
+        activities._page = mock_page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch("app.activities.browser.structlog") as mock_structlog,
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+        ):
+            mock_structlog.get_logger.return_value = mock_logger
+            await activities.navigate_to_hacker_news_activity()
+
+        log_calls = [c.args[0] for c in mock_logger.info.call_args_list]
+        assert "navigation.starting" in log_calls
+
+    async def test_logs_completed_event_on_success(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+        mock_page: AsyncMock,
+    ) -> None:
+        """Activity emits a 'navigation.completed' log event on success."""
+        mock_logger = _make_mock_logger()
+        activities._page = mock_page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch("app.activities.browser.structlog") as mock_structlog,
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+        ):
+            mock_structlog.get_logger.return_value = mock_logger
+            await activities.navigate_to_hacker_news_activity()
+
+        log_calls = [c.args[0] for c in mock_logger.info.call_args_list]
+        assert "navigation.completed" in log_calls
+
+    async def test_goto_called_with_hn_base_url(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+        mock_page: AsyncMock,
+    ) -> None:
+        """page.goto() is called with the configured HN_BASE_URL."""
+        from app.config import constants
+
+        activities._page = mock_page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+        ):
+            await activities.navigate_to_hacker_news_activity()
+
+        assert mock_page.goto.call_args.args[0] == constants.HN_BASE_URL
+
+    async def test_goto_called_with_domcontentloaded(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+        mock_page: AsyncMock,
+    ) -> None:
+        """page.goto() uses wait_until='domcontentloaded'."""
+        activities._page = mock_page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+        ):
+            await activities.navigate_to_hacker_news_activity()
+
+        assert mock_page.goto.call_args.kwargs.get("wait_until") == "domcontentloaded"
+
+    async def test_goto_called_with_configured_timeout(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+        mock_page: AsyncMock,
+    ) -> None:
+        """page.goto() uses the BROWSER_TIMEOUT_MS constant for its timeout."""
+        from app.config import constants
+
+        activities._page = mock_page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+        ):
+            await activities.navigate_to_hacker_news_activity()
+
+        assert mock_page.goto.call_args.kwargs.get("timeout") == constants.BROWSER_TIMEOUT_MS
+
+    async def test_none_response_from_goto_is_accepted(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """A None response from page.goto() (e.g. same-document nav) does not raise."""
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=None)
+        page.title = AsyncMock(return_value="Hacker News")
+        page.wait_for_selector = AsyncMock(return_value=None)
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+        ):
+            result = await activities.navigate_to_hacker_news_activity()
+
+        assert result is True
+
+    async def test_wait_for_selector_uses_athing_selector(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+        mock_page: AsyncMock,
+    ) -> None:
+        """wait_for_selector is called with '.athing' to verify story rows exist."""
+        activities._page = mock_page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+        ):
+            await activities.navigate_to_hacker_news_activity()
+
+        assert mock_page.wait_for_selector.call_args.args[0] == ".athing"
+
+    async def test_wait_for_selector_uses_attached_state(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+        mock_page: AsyncMock,
+    ) -> None:
+        """wait_for_selector uses state='attached' (DOM presence, not visibility)."""
+        activities._page = mock_page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+        ):
+            await activities.navigate_to_hacker_news_activity()
+
+        assert mock_page.wait_for_selector.call_args.kwargs.get("state") == "attached"
+
+    async def test_title_containing_hacker_news_substring_passes(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """Any title containing the substring 'Hacker News' passes the title check."""
+        response = MagicMock()
+        response.ok = True
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=response)
+        page.title = AsyncMock(return_value="Ask Hacker News")
+        page.wait_for_selector = AsyncMock(return_value=None)
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+        ):
+            result = await activities.navigate_to_hacker_news_activity()
+
+        assert result is True
+
+    # ------------------------------------------------------------------
+    # Logger context binding
+    # ------------------------------------------------------------------
+
+    async def test_logger_bound_with_activity_context_fields(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+        mock_page: AsyncMock,
+    ) -> None:
+        """Logger is bound with workflow_id, run_id, activity_id, activity_name."""
+        mock_logger = _make_mock_logger()
+        activities._page = mock_page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch("app.activities.browser.structlog") as mock_structlog,
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+        ):
+            mock_structlog.get_logger.return_value = mock_logger
+            await activities.navigate_to_hacker_news_activity()
+
+        bind_kwargs: dict[str, Any] = mock_logger.bind.call_args.kwargs
+        assert bind_kwargs["workflow_id"] == mock_info.workflow_id
+        assert bind_kwargs["run_id"] == mock_info.workflow_run_id
+        assert bind_kwargs["activity_id"] == mock_info.activity_id
+        assert bind_kwargs["activity_name"] == mock_info.activity_type
+
+    # ------------------------------------------------------------------
+    # _ensure_browser → ApplicationError (non-retryable)
+    # ------------------------------------------------------------------
+
+    async def test_reraises_application_error_from_ensure_browser(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """Non-retryable ApplicationError from _ensure_browser propagates as-is."""
+        original_exc = ApplicationError(
+            "Playwright binary not found", non_retryable=True
+        )
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(
+                activities,
+                "_ensure_browser",
+                new_callable=AsyncMock,
+                side_effect=original_exc,
+            ),
+        ):
+            with pytest.raises(ApplicationError) as exc_info:
+                await activities.navigate_to_hacker_news_activity()
+
+        assert exc_info.value is original_exc
+        assert exc_info.value.non_retryable is True
+
+    async def test_application_error_does_not_log_navigation_failed(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """ApplicationError is not logged as navigation.failed (propagates immediately)."""
+        mock_logger = _make_mock_logger()
+        original_exc = ApplicationError("binary missing", non_retryable=True)
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch("app.activities.browser.structlog") as mock_structlog,
+            patch.object(
+                activities,
+                "_ensure_browser",
+                new_callable=AsyncMock,
+                side_effect=original_exc,
+            ),
+        ):
+            mock_structlog.get_logger.return_value = mock_logger
+            with pytest.raises(ApplicationError):
+                await activities.navigate_to_hacker_news_activity()
+
+        logged_events = [c.args[0] for c in mock_logger.error.call_args_list]
+        assert "navigation.failed" not in logged_events
+
+    # ------------------------------------------------------------------
+    # _ensure_browser → BrowserStartError (retryable)
+    # ------------------------------------------------------------------
+
+    async def test_reraises_browser_start_error_from_ensure_browser(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """BrowserStartError from _ensure_browser propagates as a retryable domain exception."""
+        original_exc = BrowserStartError("Chromium failed to start")
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(
+                activities,
+                "_ensure_browser",
+                new_callable=AsyncMock,
+                side_effect=original_exc,
+            ),
+        ):
+            with pytest.raises(BrowserStartError) as exc_info:
+                await activities.navigate_to_hacker_news_activity()
+
+        assert exc_info.value is original_exc
+
+    async def test_browser_start_error_logs_failed_with_browser_unavailable_reason(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """BrowserStartError causes navigation.failed log with reason='browser_unavailable'."""
+        mock_logger = _make_mock_logger()
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch("app.activities.browser.structlog") as mock_structlog,
+            patch.object(
+                activities,
+                "_ensure_browser",
+                new_callable=AsyncMock,
+                side_effect=BrowserStartError("browser down"),
+            ),
+        ):
+            mock_structlog.get_logger.return_value = mock_logger
+            with pytest.raises(BrowserStartError):
+                await activities.navigate_to_hacker_news_activity()
+
+        logged_events = [c.args[0] for c in mock_logger.error.call_args_list]
+        assert "navigation.failed" in logged_events
+        assert mock_logger.error.call_args.kwargs.get("reason") == "browser_unavailable"
+
+    async def test_browser_start_error_log_includes_error_string(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """The navigation.failed log includes the BrowserStartError message as 'error'."""
+        mock_logger = _make_mock_logger()
+        error_message = "unique-browser-error-abc"
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch("app.activities.browser.structlog") as mock_structlog,
+            patch.object(
+                activities,
+                "_ensure_browser",
+                new_callable=AsyncMock,
+                side_effect=BrowserStartError(error_message),
+            ),
+        ):
+            mock_structlog.get_logger.return_value = mock_logger
+            with pytest.raises(BrowserStartError):
+                await activities.navigate_to_hacker_news_activity()
+
+        assert mock_logger.error.call_args.kwargs.get("error") == error_message
+
+    # ------------------------------------------------------------------
+    # page.goto() → PlaywrightError
+    # ------------------------------------------------------------------
+
+    async def test_goto_playwright_error_raises_browser_navigation_error(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """PlaywrightError from page.goto() is mapped to BrowserNavigationError."""
+        page = AsyncMock()
+        page.goto = AsyncMock(side_effect=PlaywrightError("net::ERR_NAME_NOT_RESOLVED"))
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ),
+        ):
+            with pytest.raises(BrowserNavigationError):
+                await activities.navigate_to_hacker_news_activity()
+
+    async def test_goto_playwright_error_wraps_original_cause(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """BrowserNavigationError raised from goto failure has PlaywrightError as __cause__."""
+        original = PlaywrightError("net::ERR_NAME_NOT_RESOLVED")
+        page = AsyncMock()
+        page.goto = AsyncMock(side_effect=original)
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ),
+        ):
+            with pytest.raises(BrowserNavigationError) as exc_info:
+                await activities.navigate_to_hacker_news_activity()
+
+        assert exc_info.value.__cause__ is original
+
+    async def test_goto_playwright_error_logs_failed_with_goto_error_reason(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """PlaywrightError from goto() is logged as navigation.failed with reason='goto_error'."""
+        mock_logger = _make_mock_logger()
+        page = AsyncMock()
+        page.goto = AsyncMock(side_effect=PlaywrightError("timeout"))
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch("app.activities.browser.structlog") as mock_structlog,
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ),
+        ):
+            mock_structlog.get_logger.return_value = mock_logger
+            with pytest.raises(BrowserNavigationError):
+                await activities.navigate_to_hacker_news_activity()
+
+        logged_events = [c.args[0] for c in mock_logger.error.call_args_list]
+        assert "navigation.failed" in logged_events
+        assert mock_logger.error.call_args.kwargs.get("reason") == "goto_error"
+
+    async def test_goto_playwright_error_captures_screenshot(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """_capture_screenshot is called when page.goto() raises PlaywrightError."""
+        page = AsyncMock()
+        page.goto = AsyncMock(side_effect=PlaywrightError("network error"))
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ) as mock_screenshot,
+        ):
+            with pytest.raises(BrowserNavigationError):
+                await activities.navigate_to_hacker_news_activity()
+
+        mock_screenshot.assert_awaited_once()
+
+    # ------------------------------------------------------------------
+    # HTTP error response (response.ok is False)
+    # ------------------------------------------------------------------
+
+    async def test_http_error_response_raises_browser_navigation_error(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """An HTTP error response (4xx/5xx) raises BrowserNavigationError."""
+        response = MagicMock()
+        response.ok = False
+        response.status = 503
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=response)
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ),
+        ):
+            with pytest.raises(BrowserNavigationError):
+                await activities.navigate_to_hacker_news_activity()
+
+    async def test_http_error_response_logs_failed_with_http_error_reason(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """An HTTP error response is logged as navigation.failed with reason='http_error'."""
+        mock_logger = _make_mock_logger()
+        response = MagicMock()
+        response.ok = False
+        response.status = 429
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=response)
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch("app.activities.browser.structlog") as mock_structlog,
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ),
+        ):
+            mock_structlog.get_logger.return_value = mock_logger
+            with pytest.raises(BrowserNavigationError):
+                await activities.navigate_to_hacker_news_activity()
+
+        logged_events = [c.args[0] for c in mock_logger.error.call_args_list]
+        assert "navigation.failed" in logged_events
+        assert mock_logger.error.call_args.kwargs.get("reason") == "http_error"
+
+    async def test_http_error_response_log_includes_status_code(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """The navigation.failed log for HTTP errors includes the http_status."""
+        mock_logger = _make_mock_logger()
+        response = MagicMock()
+        response.ok = False
+        response.status = 503
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=response)
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch("app.activities.browser.structlog") as mock_structlog,
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ),
+        ):
+            mock_structlog.get_logger.return_value = mock_logger
+            with pytest.raises(BrowserNavigationError):
+                await activities.navigate_to_hacker_news_activity()
+
+        assert mock_logger.error.call_args.kwargs.get("http_status") == 503
+
+    async def test_http_error_response_captures_screenshot(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """_capture_screenshot is called on HTTP error response."""
+        response = MagicMock()
+        response.ok = False
+        response.status = 500
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=response)
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ) as mock_screenshot,
+        ):
+            with pytest.raises(BrowserNavigationError):
+                await activities.navigate_to_hacker_news_activity()
+
+        mock_screenshot.assert_awaited_once()
+
+    async def test_http_ok_response_does_not_raise(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """An HTTP 200 (ok) response passes the status check without raising."""
+        response = MagicMock()
+        response.ok = True
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=response)
+        page.title = AsyncMock(return_value="Hacker News")
+        page.wait_for_selector = AsyncMock(return_value=None)
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+        ):
+            result = await activities.navigate_to_hacker_news_activity()
+
+        assert result is True
+
+    # ------------------------------------------------------------------
+    # page.title() → PlaywrightError
+    # ------------------------------------------------------------------
+
+    async def test_title_playwright_error_raises_browser_navigation_error(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """PlaywrightError from page.title() is mapped to BrowserNavigationError."""
+        response = MagicMock()
+        response.ok = True
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=response)
+        page.title = AsyncMock(
+            side_effect=PlaywrightError("execution context was destroyed")
+        )
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ),
+        ):
+            with pytest.raises(BrowserNavigationError) as exc_info:
+                await activities.navigate_to_hacker_news_activity()
+
+        assert "Could not read page title" in str(exc_info.value)
+
+    async def test_title_playwright_error_logs_failed_with_title_read_error_reason(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """PlaywrightError from title() logged as navigation.failed with reason='title_read_error'."""
+        mock_logger = _make_mock_logger()
+        response = MagicMock()
+        response.ok = True
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=response)
+        page.title = AsyncMock(side_effect=PlaywrightError("context destroyed"))
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch("app.activities.browser.structlog") as mock_structlog,
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ),
+        ):
+            mock_structlog.get_logger.return_value = mock_logger
+            with pytest.raises(BrowserNavigationError):
+                await activities.navigate_to_hacker_news_activity()
+
+        assert mock_logger.error.call_args.kwargs.get("reason") == "title_read_error"
+
+    async def test_title_playwright_error_captures_screenshot(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """_capture_screenshot is called when page.title() raises PlaywrightError."""
+        response = MagicMock()
+        response.ok = True
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=response)
+        page.title = AsyncMock(side_effect=PlaywrightError("title failed"))
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ) as mock_screenshot,
+        ):
+            with pytest.raises(BrowserNavigationError):
+                await activities.navigate_to_hacker_news_activity()
+
+        mock_screenshot.assert_awaited_once()
+
+    async def test_title_playwright_error_wraps_original_cause(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """BrowserNavigationError from title failure chains the original PlaywrightError."""
+        original = PlaywrightError("context destroyed")
+        response = MagicMock()
+        response.ok = True
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=response)
+        page.title = AsyncMock(side_effect=original)
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ),
+        ):
+            with pytest.raises(BrowserNavigationError) as exc_info:
+                await activities.navigate_to_hacker_news_activity()
+
+        assert exc_info.value.__cause__ is original
+
+    # ------------------------------------------------------------------
+    # Unexpected page title ("Hacker News" not in title)
+    # ------------------------------------------------------------------
+
+    async def test_unexpected_title_raises_browser_navigation_error(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """A title not containing 'Hacker News' raises BrowserNavigationError."""
+        response = MagicMock()
+        response.ok = True
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=response)
+        page.title = AsyncMock(return_value="Just a moment...")  # Cloudflare captcha
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ),
+        ):
+            with pytest.raises(BrowserNavigationError):
+                await activities.navigate_to_hacker_news_activity()
+
+    async def test_unexpected_title_logs_failed_with_unexpected_page_reason(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """Unexpected title logged as navigation.failed with reason='unexpected_page'."""
+        mock_logger = _make_mock_logger()
+        response = MagicMock()
+        response.ok = True
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=response)
+        page.title = AsyncMock(return_value="Access Denied")
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch("app.activities.browser.structlog") as mock_structlog,
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ),
+        ):
+            mock_structlog.get_logger.return_value = mock_logger
+            with pytest.raises(BrowserNavigationError):
+                await activities.navigate_to_hacker_news_activity()
+
+        assert mock_logger.error.call_args.kwargs.get("reason") == "unexpected_page"
+
+    async def test_unexpected_title_log_includes_page_title(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """The navigation.failed log for unexpected title includes the actual page_title."""
+        mock_logger = _make_mock_logger()
+        unexpected_title = "Captcha Required"
+        response = MagicMock()
+        response.ok = True
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=response)
+        page.title = AsyncMock(return_value=unexpected_title)
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch("app.activities.browser.structlog") as mock_structlog,
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ),
+        ):
+            mock_structlog.get_logger.return_value = mock_logger
+            with pytest.raises(BrowserNavigationError):
+                await activities.navigate_to_hacker_news_activity()
+
+        assert mock_logger.error.call_args.kwargs.get("page_title") == unexpected_title
+
+    async def test_unexpected_title_captures_screenshot(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """_capture_screenshot is called when the page title is unexpected."""
+        response = MagicMock()
+        response.ok = True
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=response)
+        page.title = AsyncMock(return_value="Google")
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ) as mock_screenshot,
+        ):
+            with pytest.raises(BrowserNavigationError):
+                await activities.navigate_to_hacker_news_activity()
+
+        mock_screenshot.assert_awaited_once()
+
+    # ------------------------------------------------------------------
+    # wait_for_selector(.athing) → PlaywrightError
+    # ------------------------------------------------------------------
+
+    async def test_wait_for_selector_playwright_error_raises_browser_navigation_error(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """PlaywrightError from wait_for_selector() is mapped to BrowserNavigationError."""
+        response = MagicMock()
+        response.ok = True
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=response)
+        page.title = AsyncMock(return_value="Hacker News")
+        page.wait_for_selector = AsyncMock(
+            side_effect=PlaywrightError("timeout exceeded")
+        )
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ),
+        ):
+            with pytest.raises(BrowserNavigationError) as exc_info:
+                await activities.navigate_to_hacker_news_activity()
+
+        assert "No story rows" in str(exc_info.value)
+
+    async def test_wait_for_selector_logs_failed_with_no_stories_found_reason(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """wait_for_selector failure logged as navigation.failed with reason='no_stories_found'."""
+        mock_logger = _make_mock_logger()
+        response = MagicMock()
+        response.ok = True
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=response)
+        page.title = AsyncMock(return_value="Hacker News")
+        page.wait_for_selector = AsyncMock(side_effect=PlaywrightError("timeout"))
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch("app.activities.browser.structlog") as mock_structlog,
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ),
+        ):
+            mock_structlog.get_logger.return_value = mock_logger
+            with pytest.raises(BrowserNavigationError):
+                await activities.navigate_to_hacker_news_activity()
+
+        assert mock_logger.error.call_args.kwargs.get("reason") == "no_stories_found"
+
+    async def test_wait_for_selector_captures_screenshot(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """_capture_screenshot is called when wait_for_selector() raises PlaywrightError."""
+        response = MagicMock()
+        response.ok = True
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=response)
+        page.title = AsyncMock(return_value="Hacker News")
+        page.wait_for_selector = AsyncMock(
+            side_effect=PlaywrightError("no .athing found")
+        )
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ) as mock_screenshot,
+        ):
+            with pytest.raises(BrowserNavigationError):
+                await activities.navigate_to_hacker_news_activity()
+
+        mock_screenshot.assert_awaited_once()
+
+    async def test_wait_for_selector_wraps_original_cause(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """BrowserNavigationError from wait_for_selector chains the original PlaywrightError."""
+        original = PlaywrightError("selector timeout")
+        response = MagicMock()
+        response.ok = True
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=response)
+        page.title = AsyncMock(return_value="Hacker News")
+        page.wait_for_selector = AsyncMock(side_effect=original)
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ),
+        ):
+            with pytest.raises(BrowserNavigationError) as exc_info:
+                await activities.navigate_to_hacker_news_activity()
+
+        assert exc_info.value.__cause__ is original
+
+    # ------------------------------------------------------------------
+    # Screenshot path propagated in log
+    # ------------------------------------------------------------------
+
+    async def test_failure_log_includes_screenshot_path_when_captured(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """When _capture_screenshot returns a path, it appears as screenshot_path in the log."""
+        from pathlib import Path
+
+        mock_logger = _make_mock_logger()
+        fake_path = Path(
+            "/tmp/hn_scraper_navigate_to_hacker_news_activity_wf-001_123.png"
+        )
+        response = MagicMock()
+        response.ok = True
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=response)
+        page.title = AsyncMock(return_value="Hacker News")
+        page.wait_for_selector = AsyncMock(side_effect=PlaywrightError("timeout"))
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch("app.activities.browser.structlog") as mock_structlog,
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=fake_path
+            ),
+        ):
+            mock_structlog.get_logger.return_value = mock_logger
+            with pytest.raises(BrowserNavigationError):
+                await activities.navigate_to_hacker_news_activity()
+
+        assert mock_logger.error.call_args.kwargs.get("screenshot_path") == str(fake_path)
+
+    async def test_failure_log_screenshot_path_is_none_when_capture_fails(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+    ) -> None:
+        """When _capture_screenshot returns None, screenshot_path in the log is None."""
+        mock_logger = _make_mock_logger()
+        response = MagicMock()
+        response.ok = True
+        page = AsyncMock()
+        page.goto = AsyncMock(return_value=response)
+        page.title = AsyncMock(return_value="Hacker News")
+        page.wait_for_selector = AsyncMock(side_effect=PlaywrightError("timeout"))
+        activities._page = page
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch("app.activities.browser.structlog") as mock_structlog,
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ),
+        ):
+            mock_structlog.get_logger.return_value = mock_logger
+            with pytest.raises(BrowserNavigationError):
+                await activities.navigate_to_hacker_news_activity()
+
+        assert mock_logger.error.call_args.kwargs.get("screenshot_path") is None
 
 
 # ===========================================================================
