@@ -9,7 +9,8 @@ Hierarchy:
     ├── BrowserError                — browser lifecycle / Playwright errors
     │   ├── BrowserStartError      — failure to launch or initialise the browser
     │   └── BrowserNavigationError — failure to navigate to a target URL
-    └── (future: PersistenceError, ParseError, …)
+    ├── ParseError                  — unexpected DOM structure during scraping
+    └── (future: PersistenceError, …)
 
 Rules:
 - No bare `except` anywhere in the codebase — always catch a specific type.
@@ -63,4 +64,24 @@ class BrowserNavigationError(BrowserError):
     All cases are transient and retryable — Temporal will apply
     BROWSER_RETRY_POLICY. The activity captures a screenshot before raising
     so that failure state is preserved for post-mortem inspection.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Scraping / parsing errors
+# ---------------------------------------------------------------------------
+
+
+class ParseError(HackerNewsScraperError):
+    """Raised when the HN DOM structure cannot be parsed as expected.
+
+    This covers:
+    - A required element (hn_id, title) is absent from a story row.
+    - Zero stories were extractable from an otherwise non-empty page.
+    - The page DOM has changed in a way that breaks all selector logic.
+
+    ParseError is always non-retryable: the same DOM will produce the same
+    failure on every attempt. The activity wraps this in
+    `ApplicationError(non_retryable=True)` before raising to Temporal so
+    that the workflow fails immediately rather than exhausting retry budget.
     """

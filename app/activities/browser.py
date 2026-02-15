@@ -40,6 +40,7 @@ import structlog
 from playwright.async_api import (
     Browser,
     BrowserContext,
+    ElementHandle,
     Error as PlaywrightError,
     Page,
     Playwright,
@@ -50,7 +51,8 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
 
 from app.config import constants
-from app.domain.exceptions import BrowserNavigationError, BrowserStartError
+from app.domain.exceptions import BrowserNavigationError, BrowserStartError, ParseError
+from app.domain.models import Story
 
 # ---------------------------------------------------------------------------
 # Activity execution options
@@ -71,6 +73,10 @@ BROWSER_START_TIMEOUT = timedelta(minutes=1)
 #: Time budget for a single attempt of navigate_to_hacker_news_activity.
 #: Covers DNS resolution + TCP handshake + TLS + server response + DOM parse.
 NAVIGATE_TIMEOUT = timedelta(minutes=1)
+
+#: Time budget for a single attempt of scrape_urls_activity.
+#: Covers DOM querying and parsing for up to SCRAPE_TOP_N story rows.
+SCRAPE_TIMEOUT = timedelta(minutes=2)
 
 
 # ---------------------------------------------------------------------------
@@ -321,9 +327,240 @@ class BrowserActivities:
         )
         return True
 
+    @activity.defn(name="scrape_urls_activity")
+    async def scrape_urls_activity(self) -> list[Story]:
+        """Scrape the top N stories from the currently loaded HN front page.
+
+        Third activity in the scrape workflow. Assumes the browser is already
+        positioned on a loaded HN page (left by navigate_to_hacker_news_activity)
+        and calls _ensure_browser() for worker-restart resilience.
+
+        Returns:
+            list[Story] — parsed stories, serialised by Temporal as JSON.
+
+        Raises:
+            ApplicationError(non_retryable=True): Playwright binary missing
+                (infra misconfiguration) or DOM parse failure.
+            BrowserStartError: Browser could not be re-launched (retryable).
+            BrowserNavigationError: Playwright DOM access failed (retryable).
+        """
+        info = activity.info()
+        log = structlog.get_logger().bind(
+            service=constants.SERVICE_NAME,
+            activity_name=info.activity_type,
+            workflow_id=info.workflow_id,
+            run_id=info.workflow_run_id,
+            activity_id=info.activity_id,
+        )
+
+        log.info(
+            "scrape.starting",
+            status="starting",
+            url=constants.HN_BASE_URL,
+            expected=constants.SCRAPE_TOP_N,
+        )
+        started_at = time.monotonic()
+
+        try:
+            await self._ensure_browser(log=log)
+        except ApplicationError:
+            raise
+        except BrowserStartError as exc:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            log.error(
+                "scrape.failed",
+                status="failed",
+                reason="browser_unavailable",
+                error=str(exc),
+                duration_ms=duration_ms,
+            )
+            raise
+
+        assert self._page is not None
+
+        try:
+            stories = await self._extract_stories(log=log)
+        except ApplicationError:
+            raise
+        except (BrowserNavigationError, ParseError) as exc:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            screenshot_path = await self._capture_screenshot(
+                info.activity_type, info.workflow_id
+            )
+            log.error(
+                "scrape.failed",
+                status="failed",
+                reason=type(exc).__name__,
+                error=str(exc),
+                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                duration_ms=duration_ms,
+            )
+            if isinstance(exc, ParseError):
+                raise ApplicationError(str(exc), non_retryable=True) from exc
+            raise
+
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        log.info(
+            "scrape.completed",
+            status="completed",
+            stories_count=len(stories),
+            duration_ms=duration_ms,
+        )
+        return stories
+
     # -------------------------------------------------------------------------
     # Internal helpers
     # -------------------------------------------------------------------------
+
+    async def _extract_stories(
+        self,
+        log: Optional[structlog.types.FilteringBoundLogger] = None,
+    ) -> list[Story]:
+        """Locate all story rows on the current page and parse each one.
+
+        Waits for .athing rows to be attached to the DOM, then processes up to
+        SCRAPE_TOP_N rows. Individual rows that fail to parse are skipped with a
+        warning; if no stories are extracted at all, ParseError is raised.
+
+        Args:
+            log: Bound structlog logger. A fresh unbound logger is used if None.
+
+        Returns:
+            Non-empty list of Story domain models.
+
+        Raises:
+            BrowserNavigationError: Playwright DOM access failed (retryable).
+            ParseError: Zero stories could be extracted from the page.
+        """
+        if log is None:
+            log = structlog.get_logger()
+        assert self._page is not None
+
+        try:
+            await self._page.wait_for_selector(
+                ".athing",
+                state="attached",
+                timeout=constants.BROWSER_TIMEOUT_MS,
+            )
+            rows = await self._page.query_selector_all("tr.athing")
+        except PlaywrightError as exc:
+            raise BrowserNavigationError(
+                f"Failed to locate story rows on HN page: {exc}"
+            ) from exc
+
+        stories: list[Story] = []
+        for rank, row in enumerate(rows[: constants.SCRAPE_TOP_N], start=1):
+            try:
+                story = await self._parse_story_row(row, fallback_rank=rank)
+                stories.append(story)
+            except ParseError as exc:
+                log.warning("scrape.story_skipped", rank=rank, reason=str(exc))
+            except PlaywrightError as exc:
+                raise BrowserNavigationError(
+                    f"Playwright error while parsing story at rank {rank}: {exc}"
+                ) from exc
+
+        if not stories:
+            raise ParseError(
+                "Extracted zero stories from the HN page — "
+                "the DOM structure may have changed."
+            )
+        return stories
+
+    async def _parse_story_row(
+        self,
+        row: ElementHandle,
+        fallback_rank: int,
+    ) -> Story:
+        """Parse a single HN story row element into a Story domain model.
+
+        Extracts hn_id, rank, title, and url from the supplied tr.athing row,
+        then delegates subtext extraction to _parse_subtext. Required fields
+        hn_id and title raise ParseError when absent; optional fields default.
+
+        Args:
+            row: ElementHandle for the tr.athing story row.
+            fallback_rank: 1-indexed page position, used if span.rank is absent.
+
+        Returns:
+            A populated, immutable Story domain model.
+
+        Raises:
+            ParseError: hn_id or title are missing or empty (non-retryable).
+        """
+        hn_id = await row.get_attribute("id")
+        if not hn_id:
+            raise ParseError(
+                f"Story row at rank {fallback_rank} is missing the id attribute."
+            )
+
+        rank_el = await row.query_selector("span.rank")
+        rank_text = (await rank_el.inner_text()).rstrip(".").strip() if rank_el else ""
+        rank = int(rank_text) if rank_text.isdigit() else fallback_rank
+
+        title_el = await row.query_selector(".titleline > a")
+        if title_el is None:
+            raise ParseError(
+                f"Story {hn_id} is missing its title element (.titleline > a)."
+            )
+        title = (await title_el.inner_text()).strip()
+        if not title:
+            raise ParseError(f"Story {hn_id} has an empty title string.")
+
+        href = (await title_el.get_attribute("href")) or ""
+        url: Optional[str] = None if href.startswith("item?id=") else href or None
+
+        points, author, comments_count = await self._parse_subtext(hn_id)
+
+        return Story(
+            hn_id=hn_id,
+            rank=rank,
+            title=title,
+            url=url,
+            points=points,
+            author=author,
+            comments_count=comments_count,
+        )
+
+    async def _parse_subtext(self, hn_id: str) -> tuple[int, str, int]:
+        """Extract points, author, and comments count from a story's subtext row.
+
+        The subtext row is the <tr> immediately following tr.athing#{hn_id}.
+        Missing optional fields (common for job posts) default gracefully:
+        points=0, author="", comments_count=0.
+
+        Args:
+            hn_id: The HN item ID used to locate the adjacent subtext row.
+
+        Returns:
+            Tuple of (points, author, comments_count).
+        """
+        assert self._page is not None
+
+        subtext = await self._page.query_selector(
+            f"tr.athing#{hn_id} + tr td.subtext"
+        )
+        if subtext is None:
+            return 0, "", 0
+
+        score_el = await subtext.query_selector("span.score")
+        points = 0
+        if score_el:
+            score_text = (await score_el.inner_text()).strip()
+            first_token = score_text.split()[0] if score_text else ""
+            points = int(first_token) if first_token.isdigit() else 0
+
+        author_el = await subtext.query_selector("a.hnuser")
+        author = (await author_el.inner_text()).strip() if author_el else ""
+
+        links = await subtext.query_selector_all("a")
+        comments_count = 0
+        if links:
+            raw = (await links[-1].inner_text()).replace("\xa0", " ").strip()
+            first_word = raw.split()[0] if raw else ""
+            comments_count = int(first_word) if first_word.isdigit() else 0
+
+        return points, author, comments_count
 
     async def _ensure_browser(
         self,

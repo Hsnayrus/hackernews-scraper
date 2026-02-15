@@ -2,10 +2,14 @@
 
 Coverage targets
 ----------------
-- ``start_playwright_activity`` — the Temporal activity entry-point.
-- ``_ensure_browser``           — internal browser lifecycle helper.
-- ``_teardown_silently``        — resource cleanup helper.
-- ``_capture_screenshot``       — best-effort screenshot helper.
+- ``start_playwright_activity``    — the Temporal activity entry-point.
+- ``_ensure_browser``              — internal browser lifecycle helper.
+- ``_teardown_silently``           — resource cleanup helper.
+- ``_capture_screenshot``          — best-effort screenshot helper.
+- ``scrape_urls_activity``         — scraping activity entry-point.
+- ``_extract_stories``             — DOM query and row-iteration helper.
+- ``_parse_story_row``             — per-row field extraction helper.
+- ``_parse_subtext``               — subtext row field extraction helper.
 
 Design decisions
 ----------------
@@ -28,7 +32,7 @@ Design decisions
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -36,7 +40,8 @@ from playwright.async_api import Error as PlaywrightError
 from temporalio.exceptions import ApplicationError
 
 from app.activities.browser import BrowserActivities
-from app.domain.exceptions import BrowserNavigationError, BrowserStartError
+from app.domain.exceptions import BrowserNavigationError, BrowserStartError, ParseError
+from app.domain.models import Story
 
 
 # ---------------------------------------------------------------------------
@@ -2202,3 +2207,821 @@ class TestCaptureScreenshot:
         result = await activities._capture_screenshot("my_activity", "wf-007")
 
         assert result is None
+
+
+# ===========================================================================
+# Shared helpers for scraping tests
+# ===========================================================================
+
+
+def _make_mock_row(
+    *,
+    hn_id: Optional[str] = "12345678",
+    rank_text: str = "1.",
+    title_text: str = "Test Story Title",
+    href: str = "https://example.com",
+) -> AsyncMock:
+    """Build a mock ElementHandle for a tr.athing story row."""
+    mock_rank_el = AsyncMock()
+    mock_rank_el.inner_text = AsyncMock(return_value=rank_text)
+
+    mock_title_el = AsyncMock()
+    mock_title_el.inner_text = AsyncMock(return_value=title_text)
+    mock_title_el.get_attribute = AsyncMock(return_value=href)
+
+    async def _row_qs(selector: str) -> Optional[AsyncMock]:
+        if selector == "span.rank":
+            return mock_rank_el
+        if selector == ".titleline > a":
+            return mock_title_el
+        return None
+
+    row = AsyncMock()
+    row.get_attribute = AsyncMock(return_value=hn_id)
+    row.query_selector = AsyncMock(side_effect=_row_qs)
+    return row
+
+
+def _make_mock_subtext(
+    *,
+    score_text: Optional[str] = "123 points",
+    author_text: Optional[str] = "alice",
+    links_texts: Optional[list[str]] = None,
+) -> AsyncMock:
+    """Build a mock ElementHandle for a td.subtext element."""
+    score_el: Optional[AsyncMock] = None
+    if score_text is not None:
+        score_el = AsyncMock()
+        score_el.inner_text = AsyncMock(return_value=score_text)
+
+    author_el: Optional[AsyncMock] = None
+    if author_text is not None:
+        author_el = AsyncMock()
+        author_el.inner_text = AsyncMock(return_value=author_text)
+
+    async def _subtext_qs(selector: str) -> Optional[AsyncMock]:
+        if selector == "span.score":
+            return score_el
+        if selector == "a.hnuser":
+            return author_el
+        return None
+
+    subtext = AsyncMock()
+    subtext.query_selector = AsyncMock(side_effect=_subtext_qs)
+
+    links: list[AsyncMock] = []
+    for text in links_texts or []:
+        link = AsyncMock()
+        link.inner_text = AsyncMock(return_value=text)
+        links.append(link)
+    subtext.query_selector_all = AsyncMock(return_value=links)
+
+    return subtext
+
+
+# ===========================================================================
+# TestScrapeUrlsActivity
+# ===========================================================================
+
+
+class TestScrapeUrlsActivity:
+    """Tests for ``BrowserActivities.scrape_urls_activity``.
+
+    ``_ensure_browser`` and ``_extract_stories`` are patched so the activity's
+    own orchestration logic (logging, error mapping, return value) is tested
+    in isolation from DOM interaction.
+    """
+
+    @pytest.fixture()
+    def activities(self) -> BrowserActivities:
+        instance = BrowserActivities()
+        instance._page = AsyncMock()
+        return instance
+
+    @pytest.fixture()
+    def mock_info(self) -> MagicMock:
+        return _make_activity_info(activity_type="scrape_urls_activity")
+
+    @pytest.fixture()
+    def mock_stories(self) -> list[MagicMock]:
+        return [MagicMock(spec=Story) for _ in range(3)]
+
+    # ------------------------------------------------------------------
+    # Success path
+    # ------------------------------------------------------------------
+
+    async def test_returns_stories_on_success(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+        mock_stories: list,
+    ) -> None:
+        """Activity returns the list produced by _extract_stories."""
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities,
+                "_extract_stories",
+                new_callable=AsyncMock,
+                return_value=mock_stories,
+            ),
+        ):
+            result = await activities.scrape_urls_activity()
+
+        assert result == mock_stories
+
+    async def test_logs_starting_and_completed_on_success(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+        mock_stories: list,
+    ) -> None:
+        """Activity emits 'scrape.starting' and 'scrape.completed' on success."""
+        mock_logger = _make_mock_logger()
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch("app.activities.browser.structlog") as mock_structlog,
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities,
+                "_extract_stories",
+                new_callable=AsyncMock,
+                return_value=mock_stories,
+            ),
+        ):
+            mock_structlog.get_logger.return_value = mock_logger
+            await activities.scrape_urls_activity()
+
+        info_events = [c.args[0] for c in mock_logger.info.call_args_list]
+        assert "scrape.starting" in info_events
+        assert "scrape.completed" in info_events
+
+    async def test_completed_log_includes_stories_count(
+        self,
+        activities: BrowserActivities,
+        mock_info: MagicMock,
+        mock_stories: list,
+    ) -> None:
+        """The 'scrape.completed' log event includes the correct stories_count."""
+        mock_logger = _make_mock_logger()
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch("app.activities.browser.structlog") as mock_structlog,
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities,
+                "_extract_stories",
+                new_callable=AsyncMock,
+                return_value=mock_stories,
+            ),
+        ):
+            mock_structlog.get_logger.return_value = mock_logger
+            await activities.scrape_urls_activity()
+
+        completed_call = next(
+            c
+            for c in mock_logger.info.call_args_list
+            if c.args[0] == "scrape.completed"
+        )
+        assert completed_call.kwargs["stories_count"] == len(mock_stories)
+
+    # ------------------------------------------------------------------
+    # ApplicationError (non-retryable) from _ensure_browser
+    # ------------------------------------------------------------------
+
+    async def test_reraises_application_error_from_ensure_browser(
+        self, activities: BrowserActivities, mock_info: MagicMock
+    ) -> None:
+        """Non-retryable ApplicationError from _ensure_browser propagates as-is."""
+        original_exc = ApplicationError("binary missing", non_retryable=True)
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(
+                activities,
+                "_ensure_browser",
+                new_callable=AsyncMock,
+                side_effect=original_exc,
+            ),
+        ):
+            with pytest.raises(ApplicationError) as exc_info:
+                await activities.scrape_urls_activity()
+
+        assert exc_info.value is original_exc
+
+    # ------------------------------------------------------------------
+    # BrowserStartError from _ensure_browser
+    # ------------------------------------------------------------------
+
+    async def test_reraises_browser_start_error_and_logs_failed(
+        self, activities: BrowserActivities, mock_info: MagicMock
+    ) -> None:
+        """BrowserStartError from _ensure_browser is logged then re-raised."""
+        mock_logger = _make_mock_logger()
+        original_exc = BrowserStartError("launch failed")
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch("app.activities.browser.structlog") as mock_structlog,
+            patch.object(
+                activities,
+                "_ensure_browser",
+                new_callable=AsyncMock,
+                side_effect=original_exc,
+            ),
+        ):
+            mock_structlog.get_logger.return_value = mock_logger
+            with pytest.raises(BrowserStartError) as exc_info:
+                await activities.scrape_urls_activity()
+
+        assert exc_info.value is original_exc
+        logged_events = [c.args[0] for c in mock_logger.error.call_args_list]
+        assert "scrape.failed" in logged_events
+
+    # ------------------------------------------------------------------
+    # BrowserNavigationError from _extract_stories
+    # ------------------------------------------------------------------
+
+    async def test_reraises_browser_navigation_error_and_logs_failed(
+        self, activities: BrowserActivities, mock_info: MagicMock
+    ) -> None:
+        """BrowserNavigationError from _extract_stories is logged then re-raised."""
+        mock_logger = _make_mock_logger()
+        original_exc = BrowserNavigationError("DOM access failed")
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch("app.activities.browser.structlog") as mock_structlog,
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities,
+                "_extract_stories",
+                new_callable=AsyncMock,
+                side_effect=original_exc,
+            ),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ),
+        ):
+            mock_structlog.get_logger.return_value = mock_logger
+            with pytest.raises(BrowserNavigationError) as exc_info:
+                await activities.scrape_urls_activity()
+
+        assert exc_info.value is original_exc
+        logged_events = [c.args[0] for c in mock_logger.error.call_args_list]
+        assert "scrape.failed" in logged_events
+
+    # ------------------------------------------------------------------
+    # ParseError from _extract_stories → non-retryable ApplicationError
+    # ------------------------------------------------------------------
+
+    async def test_parse_error_wrapped_as_non_retryable_application_error(
+        self, activities: BrowserActivities, mock_info: MagicMock
+    ) -> None:
+        """ParseError from _extract_stories is wrapped as non_retryable ApplicationError."""
+        original_exc = ParseError("DOM changed")
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities,
+                "_extract_stories",
+                new_callable=AsyncMock,
+                side_effect=original_exc,
+            ),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ),
+        ):
+            with pytest.raises(ApplicationError) as exc_info:
+                await activities.scrape_urls_activity()
+
+        assert exc_info.value.non_retryable is True
+        assert exc_info.value.__cause__ is original_exc
+
+    async def test_parse_error_logs_scrape_failed(
+        self, activities: BrowserActivities, mock_info: MagicMock
+    ) -> None:
+        """ParseError causes a 'scrape.failed' error log event."""
+        mock_logger = _make_mock_logger()
+
+        with (
+            patch("app.activities.browser.activity.info", return_value=mock_info),
+            patch("app.activities.browser.structlog") as mock_structlog,
+            patch.object(activities, "_ensure_browser", new_callable=AsyncMock),
+            patch.object(
+                activities,
+                "_extract_stories",
+                new_callable=AsyncMock,
+                side_effect=ParseError("parse failure"),
+            ),
+            patch.object(
+                activities, "_capture_screenshot", new_callable=AsyncMock, return_value=None
+            ),
+        ):
+            mock_structlog.get_logger.return_value = mock_logger
+            with pytest.raises(ApplicationError):
+                await activities.scrape_urls_activity()
+
+        logged_events = [c.args[0] for c in mock_logger.error.call_args_list]
+        assert "scrape.failed" in logged_events
+
+
+# ===========================================================================
+# TestExtractStories
+# ===========================================================================
+
+
+class TestExtractStories:
+    """Tests for ``BrowserActivities._extract_stories``.
+
+    ``self._page`` is replaced with an ``AsyncMock`` and ``_parse_story_row``
+    is patched to keep DOM interaction out of these tests.
+    """
+
+    @pytest.fixture()
+    def activities(self) -> BrowserActivities:
+        instance = BrowserActivities()
+        instance._page = AsyncMock()
+        instance._page.wait_for_selector = AsyncMock()
+        return instance
+
+    @pytest.fixture()
+    def log(self) -> MagicMock:
+        return _make_mock_logger()
+
+    def _inject_rows(self, activities: BrowserActivities, count: int) -> list[AsyncMock]:
+        """Populate page.query_selector_all with ``count`` mock row handles."""
+        rows = [AsyncMock() for _ in range(count)]
+        activities._page.query_selector_all = AsyncMock(return_value=rows)
+        return rows
+
+    # ------------------------------------------------------------------
+    # Success path
+    # ------------------------------------------------------------------
+
+    async def test_returns_all_parsed_stories(
+        self, activities: BrowserActivities, log: MagicMock
+    ) -> None:
+        """Each successfully parsed row contributes one story to the result."""
+        rows = self._inject_rows(activities, count=3)
+        mock_stories = [MagicMock(spec=Story) for _ in rows]
+
+        with patch.object(
+            activities, "_parse_story_row", new_callable=AsyncMock, side_effect=mock_stories
+        ):
+            result = await activities._extract_stories(log=log)
+
+        assert result == mock_stories
+
+    async def test_slices_rows_to_scrape_top_n(
+        self, activities: BrowserActivities, log: MagicMock
+    ) -> None:
+        """Only the first SCRAPE_TOP_N rows are passed to _parse_story_row."""
+        from app.config import constants
+
+        self._inject_rows(activities, count=constants.SCRAPE_TOP_N + 5)
+        mock_story = MagicMock(spec=Story)
+
+        with patch.object(
+            activities,
+            "_parse_story_row",
+            new_callable=AsyncMock,
+            return_value=mock_story,
+        ) as mock_parse:
+            await activities._extract_stories(log=log)
+
+        assert mock_parse.await_count == constants.SCRAPE_TOP_N
+
+    # ------------------------------------------------------------------
+    # Playwright failures on page-level calls
+    # ------------------------------------------------------------------
+
+    async def test_wait_for_selector_failure_raises_browser_navigation_error(
+        self, activities: BrowserActivities, log: MagicMock
+    ) -> None:
+        """PlaywrightError from wait_for_selector maps to BrowserNavigationError."""
+        activities._page.wait_for_selector = AsyncMock(
+            side_effect=PlaywrightError("timeout")
+        )
+
+        with pytest.raises(BrowserNavigationError) as exc_info:
+            await activities._extract_stories(log=log)
+
+        assert "Failed to locate story rows" in str(exc_info.value)
+
+    async def test_query_selector_all_failure_raises_browser_navigation_error(
+        self, activities: BrowserActivities, log: MagicMock
+    ) -> None:
+        """PlaywrightError from query_selector_all maps to BrowserNavigationError."""
+        activities._page.query_selector_all = AsyncMock(
+            side_effect=PlaywrightError("target closed")
+        )
+
+        with pytest.raises(BrowserNavigationError):
+            await activities._extract_stories(log=log)
+
+    # ------------------------------------------------------------------
+    # Individual row failures
+    # ------------------------------------------------------------------
+
+    async def test_parse_error_on_row_is_skipped_with_warning(
+        self, activities: BrowserActivities, log: MagicMock
+    ) -> None:
+        """A ParseError on one row is logged as a warning and that row is skipped."""
+        self._inject_rows(activities, count=2)
+        good_story = MagicMock(spec=Story)
+
+        with patch.object(
+            activities,
+            "_parse_story_row",
+            new_callable=AsyncMock,
+            side_effect=[ParseError("missing id"), good_story],
+        ):
+            result = await activities._extract_stories(log=log)
+
+        assert result == [good_story]
+        log.warning.assert_called_once()
+        assert "scrape.story_skipped" in log.warning.call_args.args
+
+    async def test_playwright_error_on_row_raises_browser_navigation_error(
+        self, activities: BrowserActivities, log: MagicMock
+    ) -> None:
+        """A PlaywrightError during row parsing maps to BrowserNavigationError."""
+        self._inject_rows(activities, count=1)
+
+        with patch.object(
+            activities,
+            "_parse_story_row",
+            new_callable=AsyncMock,
+            side_effect=PlaywrightError("target closed"),
+        ):
+            with pytest.raises(BrowserNavigationError):
+                await activities._extract_stories(log=log)
+
+    # ------------------------------------------------------------------
+    # Zero stories
+    # ------------------------------------------------------------------
+
+    async def test_all_rows_failing_raises_parse_error(
+        self, activities: BrowserActivities, log: MagicMock
+    ) -> None:
+        """ParseError is raised when every row fails to parse."""
+        self._inject_rows(activities, count=2)
+
+        with patch.object(
+            activities,
+            "_parse_story_row",
+            new_callable=AsyncMock,
+            side_effect=ParseError("bad row"),
+        ):
+            with pytest.raises(ParseError) as exc_info:
+                await activities._extract_stories(log=log)
+
+        assert "zero stories" in str(exc_info.value).lower()
+
+    async def test_empty_row_list_raises_parse_error(
+        self, activities: BrowserActivities, log: MagicMock
+    ) -> None:
+        """ParseError is raised when query_selector_all returns no rows."""
+        activities._page.query_selector_all = AsyncMock(return_value=[])
+
+        with pytest.raises(ParseError):
+            await activities._extract_stories(log=log)
+
+    # ------------------------------------------------------------------
+    # Default logger (log=None)
+    # ------------------------------------------------------------------
+
+    async def test_uses_structlog_default_when_log_is_none(
+        self, activities: BrowserActivities
+    ) -> None:
+        """Passing log=None does not raise; a fresh logger is used internally."""
+        self._inject_rows(activities, count=1)
+        mock_story = MagicMock(spec=Story)
+
+        with patch.object(
+            activities, "_parse_story_row", new_callable=AsyncMock, return_value=mock_story
+        ):
+            result = await activities._extract_stories(log=None)
+
+        assert result == [mock_story]
+
+
+# ===========================================================================
+# TestParseStoryRow
+# ===========================================================================
+
+
+class TestParseStoryRow:
+    """Tests for ``BrowserActivities._parse_story_row``.
+
+    The row ElementHandle is constructed by ``_make_mock_row``. ``_parse_subtext``
+    is patched so field extraction is tested independently of subtext parsing.
+    """
+
+    @pytest.fixture()
+    def activities(self) -> BrowserActivities:
+        instance = BrowserActivities()
+        instance._page = AsyncMock()
+        return instance
+
+    # ------------------------------------------------------------------
+    # Success path — external URL story
+    # ------------------------------------------------------------------
+
+    async def test_hn_id_mapped_correctly(self, activities: BrowserActivities) -> None:
+        """Story.hn_id matches the id attribute on the row element."""
+        row = _make_mock_row(hn_id="99887766")
+
+        with patch.object(
+            activities, "_parse_subtext", new_callable=AsyncMock, return_value=(100, "alice", 42)
+        ):
+            story = await activities._parse_story_row(row, fallback_rank=1)
+
+        assert story.hn_id == "99887766"
+
+    async def test_external_url_preserved(self, activities: BrowserActivities) -> None:
+        """A standard https:// href is kept as the story URL."""
+        row = _make_mock_row(href="https://example.com/article")
+
+        with patch.object(
+            activities, "_parse_subtext", new_callable=AsyncMock, return_value=(0, "", 0)
+        ):
+            story = await activities._parse_story_row(row, fallback_rank=1)
+
+        assert story.url == "https://example.com/article"
+
+    async def test_ask_hn_relative_href_yields_url_none(
+        self, activities: BrowserActivities
+    ) -> None:
+        """An href starting with 'item?id=' maps to url=None (Ask HN / Show HN)."""
+        row = _make_mock_row(href="item?id=12345678")
+
+        with patch.object(
+            activities, "_parse_subtext", new_callable=AsyncMock, return_value=(0, "", 0)
+        ):
+            story = await activities._parse_story_row(row, fallback_rank=1)
+
+        assert story.url is None
+
+    async def test_rank_parsed_from_span_rank_element(
+        self, activities: BrowserActivities
+    ) -> None:
+        """Rank is parsed from span.rank text, stripping the trailing dot."""
+        row = _make_mock_row(rank_text="7.")
+
+        with patch.object(
+            activities, "_parse_subtext", new_callable=AsyncMock, return_value=(0, "", 0)
+        ):
+            story = await activities._parse_story_row(row, fallback_rank=99)
+
+        assert story.rank == 7
+
+    async def test_fallback_rank_used_when_rank_element_absent(
+        self, activities: BrowserActivities
+    ) -> None:
+        """fallback_rank is used when span.rank returns None."""
+        async def _qs_no_rank(selector: str) -> Optional[AsyncMock]:
+            if selector == ".titleline > a":
+                el = AsyncMock()
+                el.inner_text = AsyncMock(return_value="Title")
+                el.get_attribute = AsyncMock(return_value="https://example.com")
+                return el
+            return None
+
+        row = AsyncMock()
+        row.get_attribute = AsyncMock(return_value="12345678")
+        row.query_selector = AsyncMock(side_effect=_qs_no_rank)
+
+        with patch.object(
+            activities, "_parse_subtext", new_callable=AsyncMock, return_value=(0, "", 0)
+        ):
+            story = await activities._parse_story_row(row, fallback_rank=5)
+
+        assert story.rank == 5
+
+    async def test_fallback_rank_used_when_rank_text_is_non_digit(
+        self, activities: BrowserActivities
+    ) -> None:
+        """fallback_rank is used when span.rank contains non-digit text."""
+        row = _make_mock_row(rank_text="N/A")
+
+        with patch.object(
+            activities, "_parse_subtext", new_callable=AsyncMock, return_value=(0, "", 0)
+        ):
+            story = await activities._parse_story_row(row, fallback_rank=3)
+
+        assert story.rank == 3
+
+    async def test_delegates_subtext_to_parse_subtext(
+        self, activities: BrowserActivities
+    ) -> None:
+        """points, author, comments_count are sourced from _parse_subtext."""
+        row = _make_mock_row()
+
+        with patch.object(
+            activities,
+            "_parse_subtext",
+            new_callable=AsyncMock,
+            return_value=(250, "bob", 73),
+        ) as mock_sub:
+            story = await activities._parse_story_row(row, fallback_rank=1)
+
+        mock_sub.assert_awaited_once_with("12345678")
+        assert story.points == 250
+        assert story.author == "bob"
+        assert story.comments_count == 73
+
+    # ------------------------------------------------------------------
+    # Missing required fields → ParseError
+    # ------------------------------------------------------------------
+
+    async def test_missing_hn_id_raises_parse_error(
+        self, activities: BrowserActivities
+    ) -> None:
+        """None id attribute on the row raises ParseError."""
+        row = _make_mock_row(hn_id=None)
+
+        with pytest.raises(ParseError) as exc_info:
+            await activities._parse_story_row(row, fallback_rank=1)
+
+        assert "id attribute" in str(exc_info.value)
+
+    async def test_missing_title_element_raises_parse_error(
+        self, activities: BrowserActivities
+    ) -> None:
+        """Absent .titleline > a raises ParseError."""
+        async def _qs_no_title(selector: str) -> Optional[AsyncMock]:
+            if selector == "span.rank":
+                el = AsyncMock()
+                el.inner_text = AsyncMock(return_value="1.")
+                return el
+            return None  # .titleline > a is absent
+
+        row = AsyncMock()
+        row.get_attribute = AsyncMock(return_value="12345678")
+        row.query_selector = AsyncMock(side_effect=_qs_no_title)
+
+        with pytest.raises(ParseError) as exc_info:
+            await activities._parse_story_row(row, fallback_rank=1)
+
+        assert "title element" in str(exc_info.value)
+
+    async def test_empty_title_string_raises_parse_error(
+        self, activities: BrowserActivities
+    ) -> None:
+        """An empty title string after stripping raises ParseError."""
+        row = _make_mock_row(title_text="")
+
+        with pytest.raises(ParseError) as exc_info:
+            await activities._parse_story_row(row, fallback_rank=1)
+
+        assert "empty title" in str(exc_info.value)
+
+
+# ===========================================================================
+# TestParseSubtext
+# ===========================================================================
+
+
+class TestParseSubtext:
+    """Tests for ``BrowserActivities._parse_subtext``.
+
+    ``self._page.query_selector`` is replaced with an ``AsyncMock`` that returns
+    a mock td.subtext element (built by ``_make_mock_subtext``).
+    """
+
+    @pytest.fixture()
+    def activities(self) -> BrowserActivities:
+        instance = BrowserActivities()
+        instance._page = AsyncMock()
+        return instance
+
+    # ------------------------------------------------------------------
+    # No subtext row found
+    # ------------------------------------------------------------------
+
+    async def test_returns_all_zeros_when_subtext_absent(
+        self, activities: BrowserActivities
+    ) -> None:
+        """Returns (0, '', 0) when the td.subtext element is not found."""
+        activities._page.query_selector = AsyncMock(return_value=None)
+
+        result = await activities._parse_subtext("12345678")
+
+        assert result == (0, "", 0)
+
+    # ------------------------------------------------------------------
+    # Points extraction
+    # ------------------------------------------------------------------
+
+    async def test_extracts_points_from_score_span(
+        self, activities: BrowserActivities
+    ) -> None:
+        """Points are parsed from the leading integer in span.score text."""
+        subtext = _make_mock_subtext(score_text="456 points")
+        activities._page.query_selector = AsyncMock(return_value=subtext)
+
+        points, _, _ = await activities._parse_subtext("12345678")
+
+        assert points == 456
+
+    async def test_points_zero_when_score_span_absent(
+        self, activities: BrowserActivities
+    ) -> None:
+        """points=0 when span.score is absent (e.g. job postings)."""
+        subtext = _make_mock_subtext(score_text=None)
+        activities._page.query_selector = AsyncMock(return_value=subtext)
+
+        points, _, _ = await activities._parse_subtext("12345678")
+
+        assert points == 0
+
+    async def test_points_zero_for_non_numeric_score_text(
+        self, activities: BrowserActivities
+    ) -> None:
+        """points=0 when span.score contains non-numeric text."""
+        subtext = _make_mock_subtext(score_text="N/A")
+        activities._page.query_selector = AsyncMock(return_value=subtext)
+
+        points, _, _ = await activities._parse_subtext("12345678")
+
+        assert points == 0
+
+    # ------------------------------------------------------------------
+    # Author extraction
+    # ------------------------------------------------------------------
+
+    async def test_extracts_author_from_hnuser_link(
+        self, activities: BrowserActivities
+    ) -> None:
+        """Author is the inner text of a.hnuser."""
+        subtext = _make_mock_subtext(author_text="bob123")
+        activities._page.query_selector = AsyncMock(return_value=subtext)
+
+        _, author, _ = await activities._parse_subtext("12345678")
+
+        assert author == "bob123"
+
+    async def test_author_empty_when_hnuser_absent(
+        self, activities: BrowserActivities
+    ) -> None:
+        """author='' when a.hnuser is absent (e.g. job postings)."""
+        subtext = _make_mock_subtext(author_text=None)
+        activities._page.query_selector = AsyncMock(return_value=subtext)
+
+        _, author, _ = await activities._parse_subtext("12345678")
+
+        assert author == ""
+
+    # ------------------------------------------------------------------
+    # Comments count extraction
+    # ------------------------------------------------------------------
+
+    async def test_extracts_comments_count_from_last_link(
+        self, activities: BrowserActivities
+    ) -> None:
+        """comments_count is parsed from the leading integer of the last link."""
+        subtext = _make_mock_subtext(links_texts=["3 hours ago", "45\xa0comments"])
+        activities._page.query_selector = AsyncMock(return_value=subtext)
+
+        _, _, comments = await activities._parse_subtext("12345678")
+
+        assert comments == 45
+
+    async def test_discuss_link_maps_to_zero_comments(
+        self, activities: BrowserActivities
+    ) -> None:
+        """'discuss' as the last link maps to comments_count=0."""
+        subtext = _make_mock_subtext(links_texts=["3 hours ago", "discuss"])
+        activities._page.query_selector = AsyncMock(return_value=subtext)
+
+        _, _, comments = await activities._parse_subtext("12345678")
+
+        assert comments == 0
+
+    async def test_no_links_maps_to_zero_comments(
+        self, activities: BrowserActivities
+    ) -> None:
+        """comments_count=0 when there are no links in the subtext."""
+        subtext = _make_mock_subtext(links_texts=[])
+        activities._page.query_selector = AsyncMock(return_value=subtext)
+
+        _, _, comments = await activities._parse_subtext("12345678")
+
+        assert comments == 0
+
+    async def test_non_breaking_space_in_comments_text_is_normalised(
+        self, activities: BrowserActivities
+    ) -> None:
+        """Non-breaking spaces in link text are replaced before parsing."""
+        subtext = _make_mock_subtext(links_texts=["12\xa0comments"])
+        activities._page.query_selector = AsyncMock(return_value=subtext)
+
+        _, _, comments = await activities._parse_subtext("12345678")
+
+        assert comments == 12
