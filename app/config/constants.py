@@ -66,3 +66,24 @@ LOG_LEVEL: str = os.environ["LOG_LEVEL"]
 
 HN_BASE_URL: str = os.environ["HN_BASE_URL"]
 SCRAPE_TOP_N: int = int(os.environ["SCRAPE_TOP_N"])
+
+# ---------------------------------------------------------------------------
+# Browser (Playwright)
+#
+# These are optional — sensible defaults exist for all values. os.environ.get
+# is intentional here: unlike required infrastructure config (DB, Temporal),
+# browser tuning parameters have safe defaults and should not block startup.
+# ---------------------------------------------------------------------------
+
+# Run browser in headless mode. Set to "false" locally to watch the browser.
+BROWSER_HEADLESS: bool = os.environ.get("BROWSER_HEADLESS", "true").lower() == "true"
+
+# Milliseconds to wait for a navigation or element before raising TimeoutError.
+BROWSER_TIMEOUT_MS: int = int(os.environ.get("BROWSER_TIMEOUT_MS", "30000"))
+
+# Viewport dimensions. HN renders correctly at any reasonable size.
+BROWSER_VIEWPORT_WIDTH: int = int(os.environ.get("BROWSER_VIEWPORT_WIDTH", "1280"))
+BROWSER_VIEWPORT_HEIGHT: int = int(os.environ.get("BROWSER_VIEWPORT_HEIGHT", "800"))
+
+# Directory for failure screenshots. Must be writable by the worker process.
+BROWSER_SCREENSHOT_DIR: str = os.environ.get("BROWSER_SCREENSHOT_DIR", "/tmp")
