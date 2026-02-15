@@ -1,0 +1,124 @@
+version: "3.9"
+
+# All services communicate over this bridge network.
+# Service hostnames match container names (e.g. postgres:5432, temporal:7233).
+networks:
+  hn_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # postgres — primary datastore for application data and Temporal internals.
+  # The ${POSTGRES_USER} created by the official image is a superuser, so
+  # Temporal auto-setup can create its own databases (temporal, temporal_visibility).
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: hn_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - hn_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # temporal — Temporal server (auto-setup mode).
+  # auto-setup creates the temporal and temporal_visibility schemas in Postgres
+  # on first boot. POSTGRES_SEEDS points to the postgres service hostname.
+  # ---------------------------------------------------------------------------
+  temporal:
+    image: temporalio/auto-setup:1.24.2
+    container_name: hn_temporal
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PWD=${POSTGRES_PASSWORD}
+      - POSTGRES_SEEDS=postgres
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_BROADCAST_ADDRESS=temporal
+    ports:
+      - "7233:7233"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - hn_net
+    # Temporal auto-setup can take 10-30s to initialise its schema on first run.
+    # api and worker use restart: on-failure to tolerate that startup window.
+
+  # ---------------------------------------------------------------------------
+  # api — FastAPI HTTP service.
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    container_name: hn_api
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${POSTGRES_DB}
+      - DB_USER=${POSTGRES_USER}
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+      - TEMPORAL_HOST=temporal
+      - TEMPORAL_PORT=7233
+      - TEMPORAL_NAMESPACE=default
+      - TEMPORAL_TASK_QUEUE=${TEMPORAL_TASK_QUEUE}
+      - SERVICE_NAME=api
+      - LOG_LEVEL=${LOG_LEVEL}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    restart: on-failure
+    networks:
+      - hn_net
+
+  # ---------------------------------------------------------------------------
+  # worker — Temporal worker with Playwright for browser-based scraping.
+  # ---------------------------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    container_name: hn_worker
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${POSTGRES_DB}
+      - DB_USER=${POSTGRES_USER}
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+      - TEMPORAL_HOST=temporal
+      - TEMPORAL_PORT=7233
+      - TEMPORAL_NAMESPACE=default
+      - TEMPORAL_TASK_QUEUE=${TEMPORAL_TASK_QUEUE}
+      - SERVICE_NAME=worker
+      - LOG_LEVEL=${LOG_LEVEL}
+      - HN_BASE_URL=${HN_BASE_URL}
+      - SCRAPE_TOP_N=${SCRAPE_TOP_N}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    restart: on-failure
+    networks:
+      - hn_net
