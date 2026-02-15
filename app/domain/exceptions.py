@@ -7,7 +7,8 @@ and re-raised as the appropriate domain exception here.
 Hierarchy:
     HackerNewsScraperError          — root for all application errors
     ├── BrowserError                — browser lifecycle / Playwright errors
-    │   └── BrowserStartError      — failure to launch or initialise the browser
+    │   ├── BrowserStartError      — failure to launch or initialise the browser
+    │   └── BrowserNavigationError — failure to navigate to a target URL
     └── (future: PersistenceError, ParseError, …)
 
 Rules:
@@ -46,4 +47,20 @@ class BrowserStartError(BrowserError):
     The activity is responsible for wrapping this in
     `temporalio.exceptions.ApplicationError(non_retryable=True)` when the
     failure is a hard infra misconfiguration (e.g. missing binary).
+    """
+
+
+class BrowserNavigationError(BrowserError):
+    """Raised when the browser fails to navigate to a target URL.
+
+    This covers:
+    - Network timeout during page.goto()
+    - DNS resolution failure
+    - Page load timeout (domcontentloaded not reached within timeout)
+    - Unexpected page content (captcha, error page, unexpected title)
+    - Expected DOM elements not present after navigation
+
+    All cases are transient and retryable — Temporal will apply
+    BROWSER_RETRY_POLICY. The activity captures a screenshot before raising
+    so that failure state is preserved for post-mortem inspection.
     """

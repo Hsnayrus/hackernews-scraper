@@ -50,7 +50,7 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
 
 from app.config import constants
-from app.domain.exceptions import BrowserStartError
+from app.domain.exceptions import BrowserNavigationError, BrowserStartError
 
 # ---------------------------------------------------------------------------
 # Activity execution options
@@ -67,6 +67,10 @@ BROWSER_RETRY_POLICY = RetryPolicy(
 
 #: Time budget for a single attempt of start_playwright_activity.
 BROWSER_START_TIMEOUT = timedelta(minutes=1)
+
+#: Time budget for a single attempt of navigate_to_hacker_news_activity.
+#: Covers DNS resolution + TCP handshake + TLS + server response + DOM parse.
+NAVIGATE_TIMEOUT = timedelta(minutes=1)
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +146,177 @@ class BrowserActivities:
         log.info(
             "browser_activity.completed",
             status="completed",
+            duration_ms=duration_ms,
+        )
+        return True
+
+    @activity.defn(name="navigate_to_hacker_news_activity")
+    async def navigate_to_hacker_news_activity(self) -> bool:
+        """Navigate the browser to the Hacker News homepage and verify the page loaded.
+
+        This is the second activity in the scrape workflow. It navigates to
+        `constants.HN_BASE_URL`, waits for the DOM to be ready, and verifies
+        that the page is a valid HN front page by asserting:
+          1. The page title contains "Hacker News".
+          2. At least one story row (CSS selector `.athing`) is present.
+
+        `_ensure_browser()` is called at entry so the activity is resilient to
+        worker restart between `start_playwright_activity` and this step — the
+        browser is transparently relaunched if state was lost.
+
+        Returns:
+            True when the browser is positioned on a loaded HN front page.
+
+        Raises:
+            ApplicationError(non_retryable=True): Playwright binary not found
+                (propagated from _ensure_browser — infra misconfiguration).
+            BrowserStartError: Browser could not be (re-)launched (retryable).
+            BrowserNavigationError: Navigation or page verification failed
+                (retryable). A failure screenshot is captured before raising.
+        """
+        info = activity.info()
+        log = structlog.get_logger().bind(
+            service=constants.SERVICE_NAME,
+            activity_name=info.activity_type,
+            workflow_id=info.workflow_id,
+            run_id=info.workflow_run_id,
+            activity_id=info.activity_id,
+        )
+
+        log.info("navigation.starting", status="starting", url=constants.HN_BASE_URL)
+        started_at = time.monotonic()
+
+        try:
+            await self._ensure_browser(log=log)
+        except ApplicationError:
+            raise
+        except BrowserStartError as exc:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            log.error(
+                "navigation.failed",
+                status="failed",
+                reason="browser_unavailable",
+                error=str(exc),
+                duration_ms=duration_ms,
+            )
+            raise
+
+        assert self._page is not None  # guaranteed by _ensure_browser
+
+        try:
+            response = await self._page.goto(
+                constants.HN_BASE_URL,
+                wait_until="domcontentloaded",
+                timeout=constants.BROWSER_TIMEOUT_MS,
+            )
+        except PlaywrightError as exc:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            screenshot_path = await self._capture_screenshot(
+                info.activity_type, info.workflow_id
+            )
+            log.error(
+                "navigation.failed",
+                status="failed",
+                reason="goto_error",
+                url=constants.HN_BASE_URL,
+                error=str(exc),
+                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                duration_ms=duration_ms,
+            )
+            raise BrowserNavigationError(
+                f"Failed to navigate to {constants.HN_BASE_URL}: {exc}"
+            ) from exc
+
+        # An HTTP error response (4xx / 5xx) does not raise in Playwright —
+        # check the status code explicitly so we surface it clearly.
+        if response is not None and not response.ok:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            screenshot_path = await self._capture_screenshot(
+                info.activity_type, info.workflow_id
+            )
+            log.error(
+                "navigation.failed",
+                status="failed",
+                reason="http_error",
+                url=constants.HN_BASE_URL,
+                http_status=response.status,
+                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                duration_ms=duration_ms,
+            )
+            raise BrowserNavigationError(
+                f"Unexpected HTTP {response.status} from {constants.HN_BASE_URL}"
+            )
+
+        # Verify page identity: title must contain "Hacker News".
+        try:
+            title = await self._page.title()
+        except PlaywrightError as exc:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            screenshot_path = await self._capture_screenshot(
+                info.activity_type, info.workflow_id
+            )
+            log.error(
+                "navigation.failed",
+                status="failed",
+                reason="title_read_error",
+                error=str(exc),
+                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                duration_ms=duration_ms,
+            )
+            raise BrowserNavigationError(
+                f"Could not read page title after navigation: {exc}"
+            ) from exc
+
+        if "Hacker News" not in title:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            screenshot_path = await self._capture_screenshot(
+                info.activity_type, info.workflow_id
+            )
+            log.error(
+                "navigation.failed",
+                status="failed",
+                reason="unexpected_page",
+                page_title=title,
+                url=constants.HN_BASE_URL,
+                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                duration_ms=duration_ms,
+            )
+            raise BrowserNavigationError(
+                f"Unexpected page title '{title}' — expected 'Hacker News'. "
+                "Site may be returning a captcha or error page."
+            )
+
+        # Verify at least one story row is present in the DOM.
+        try:
+            await self._page.wait_for_selector(
+                ".athing",
+                state="attached",
+                timeout=constants.BROWSER_TIMEOUT_MS,
+            )
+        except PlaywrightError as exc:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            screenshot_path = await self._capture_screenshot(
+                info.activity_type, info.workflow_id
+            )
+            log.error(
+                "navigation.failed",
+                status="failed",
+                reason="no_stories_found",
+                error=str(exc),
+                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                duration_ms=duration_ms,
+            )
+            raise BrowserNavigationError(
+                f"No story rows (.athing) found on {constants.HN_BASE_URL} "
+                f"within timeout: {exc}"
+            ) from exc
+
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        log.info(
+            "navigation.completed",
+            status="completed",
+            url=constants.HN_BASE_URL,
+            page_title=title,
             duration_ms=duration_ms,
         )
         return True
