@@ -41,14 +41,16 @@ def _to_run_response(r: ScrapeRun) -> ScrapeRunResponse:
     status_code=status.HTTP_200_OK,
     summary="List scrape run history",
     description=(
-        "Returns metadata about previous ScrapeHackerNewsWorkflow executions, "
+        "Returns metadata about all previous ScrapeHackerNewsWorkflow executions, "
         "ordered by start time descending (most recent first). "
         "Use `limit` to cap the result count and `status` to filter by lifecycle state."
     ),
 )
 async def list_runs(
     repo: ScrapeRunRepoDep,
-    limit: int = Query(default=50, ge=1, le=200, description="Maximum runs to return."),
+    limit: Optional[int] = Query(
+        default=None, ge=1, description="Maximum runs to return. If not provided, returns all runs."
+    ),
     status_filter: Optional[ScrapeRunStatus] = Query(
         default=None,
         alias="status",
@@ -59,7 +61,7 @@ async def list_runs(
 
     Args:
         repo:          ScrapeRunRepository (injected).
-        limit:         Maximum number of runs to return (1–200).
+        limit:         Maximum number of runs to return. None returns all.
         status_filter: If provided, only return runs in this lifecycle state.
 
     Returns:
