@@ -328,12 +328,15 @@ class BrowserActivities:
         return True
 
     @activity.defn(name="scrape_urls_activity")
-    async def scrape_urls_activity(self) -> list[Story]:
+    async def scrape_urls_activity(self, top_n: int) -> list[Story]:
         """Scrape the top N stories from the currently loaded HN front page.
 
         Third activity in the scrape workflow. Assumes the browser is already
         positioned on a loaded HN page (left by navigate_to_hacker_news_activity)
         and calls _ensure_browser() for worker-restart resilience.
+
+        Args:
+            top_n: Number of top stories to scrape.
 
         Returns:
             list[Story] — parsed stories, serialised by Temporal as JSON.
@@ -357,7 +360,7 @@ class BrowserActivities:
             "scrape.starting",
             status="starting",
             url=constants.HN_BASE_URL,
-            expected=constants.SCRAPE_TOP_N,
+            expected=top_n,
         )
         started_at = time.monotonic()
 
@@ -379,7 +382,7 @@ class BrowserActivities:
         assert self._page is not None
 
         try:
-            stories = await self._extract_stories(log=log)
+            stories = await self._extract_stories(top_n=top_n, log=log)
         except ApplicationError:
             raise
         except (BrowserNavigationError, ParseError) as exc:
@@ -414,15 +417,17 @@ class BrowserActivities:
 
     async def _extract_stories(
         self,
+        top_n: int,
         log: Optional[structlog.types.FilteringBoundLogger] = None,
     ) -> list[Story]:
         """Locate all story rows on the current page and parse each one.
 
         Waits for .athing rows to be attached to the DOM, then processes up to
-        SCRAPE_TOP_N rows. Individual rows that fail to parse are skipped with a
+        top_n rows. Individual rows that fail to parse are skipped with a
         warning; if no stories are extracted at all, ParseError is raised.
 
         Args:
+            top_n: Maximum number of stories to extract.
             log: Bound structlog logger. A fresh unbound logger is used if None.
 
         Returns:
@@ -449,7 +454,7 @@ class BrowserActivities:
             ) from exc
 
         stories: list[Story] = []
-        for rank, row in enumerate(rows[: constants.SCRAPE_TOP_N], start=1):
+        for rank, row in enumerate(rows[:top_n], start=1):
             try:
                 story = await self._parse_story_row(row, fallback_rank=rank)
                 stories.append(story)

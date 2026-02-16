@@ -160,6 +160,7 @@ class ScrapeHackerNewsWorkflow:
 
             stories: list[Story] = await workflow.execute_activity_method(
                 "scrape_urls_activity",
+                args=[top_n],
                 start_to_close_timeout=SCRAPE_TIMEOUT,
                 retry_policy=BROWSER_RETRY_POLICY,
             )
