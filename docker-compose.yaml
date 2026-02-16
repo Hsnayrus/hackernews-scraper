@@ -1,5 +1,3 @@
-version: "3.9"
-
 # All services communicate over this bridge network.
 # Service hostnames match container names (e.g. postgres:5432, temporal:7233).
 networks:
@@ -10,7 +8,6 @@ volumes:
   postgres_data:
 
 services:
-
   # ---------------------------------------------------------------------------
   # postgres — primary datastore for application data and Temporal internals.
   # The ${POSTGRES_USER} created by the official image is a superuser, so
@@ -28,7 +25,7 @@ services:
     networks:
       - hn_net
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "psql -U ${POSTGRES_USER} -d ${POSTGRES_DB} -c 'SELECT 1' -q --no-align --tuples-only"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -43,14 +40,16 @@ services:
     container_name: hn_temporal
     environment:
       - DB=postgres12
-      - DB_PORT=5432
+      - DB_PORT=${POSTGRES_PORT}
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PWD=${POSTGRES_PASSWORD}
-      - POSTGRES_SEEDS=postgres
-      - TEMPORAL_ADDRESS=temporal:7233
-      - TEMPORAL_BROADCAST_ADDRESS=temporal
+      - POSTGRES_SEEDS=${POSTGRES_HOST}
+      # TEMPORAL_ADDRESS and TEMPORAL_BROADCAST_ADDRESS are intentionally omitted:
+      # auto-setup binds to 0.0.0.0:7233 by default and ringpop requires an IP
+      # (not a hostname) for broadcastAddress — the default (127.0.0.1) is correct
+      # for a single-node compose deployment.
     ports:
-      - "7233:7233"
+      - "${TEMPORAL_PORT}:${TEMPORAL_PORT}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -58,6 +57,52 @@ services:
       - hn_net
     # Temporal auto-setup can take 10-30s to initialise its schema on first run.
     # api and worker use restart: on-failure to tolerate that startup window.
+
+  # ---------------------------------------------------------------------------
+  # temporal-ui — Web interface for monitoring workflows and activities.
+  # ---------------------------------------------------------------------------
+  temporal-ui:
+    image: temporalio/ui:2.22.3
+    container_name: hn_temporal_ui
+    depends_on:
+      temporal:
+        condition: service_started
+    environment:
+      - TEMPORAL_ADDRESS=${TEMPORAL_HOST}:${TEMPORAL_PORT}
+      - TEMPORAL_CORS_ORIGINS=${TEMPORAL_CORS_ORIGINS}
+    ports:
+      - "${TEMPORAL_UI_PORT}:8080"
+    networks:
+      - hn_net
+
+  # ---------------------------------------------------------------------------
+  # temporal-admin-setup — init container that creates the default namespace.
+  # Uses tctl (Temporal CLI) to register the namespace before workers start.
+  # This service runs once, exits successfully, then worker can start.
+  # ---------------------------------------------------------------------------
+  temporal-admin-setup:
+    image: temporalio/auto-setup:1.24.2
+    container_name: hn_temporal_admin_setup
+    depends_on:
+      temporal:
+        condition: service_started
+    networks:
+      - hn_net
+    environment:
+      - TEMPORAL_HOST=${TEMPORAL_HOST}
+      - TEMPORAL_PORT=${TEMPORAL_PORT}
+      - TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE}
+    entrypoint: /bin/sh
+    command: >
+      -c "
+        echo 'Waiting for Temporal server to be ready...' &&
+        sleep 10 &&
+        echo \"Registering namespace: $$TEMPORAL_NAMESPACE\" &&
+        tctl --address $$TEMPORAL_HOST:$$TEMPORAL_PORT namespace register $$TEMPORAL_NAMESPACE 2>&1 | grep -q 'Namespace already exists' && echo 'Namespace already exists (OK)' ||
+        (tctl --address $$TEMPORAL_HOST:$$TEMPORAL_PORT namespace register $$TEMPORAL_NAMESPACE && echo 'Namespace created successfully') &&
+        echo 'Namespace registration complete.'
+      "
+    restart: "no"
 
   # ---------------------------------------------------------------------------
   # api — FastAPI HTTP service.
@@ -69,19 +114,21 @@ services:
       target: api
     container_name: hn_api
     environment:
-      - DB_HOST=postgres
-      - DB_PORT=5432
+      - DB_HOST=${POSTGRES_HOST}
+      - DB_PORT=${POSTGRES_PORT}
       - DB_NAME=${POSTGRES_DB}
       - DB_USER=${POSTGRES_USER}
       - DB_PASSWORD=${POSTGRES_PASSWORD}
-      - TEMPORAL_HOST=temporal
-      - TEMPORAL_PORT=7233
-      - TEMPORAL_NAMESPACE=default
+      - TEMPORAL_HOST=${TEMPORAL_HOST}
+      - TEMPORAL_PORT=${TEMPORAL_PORT}
+      - TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE}
       - TEMPORAL_TASK_QUEUE=${TEMPORAL_TASK_QUEUE}
       - SERVICE_NAME=api
       - LOG_LEVEL=${LOG_LEVEL}
+      - HN_BASE_URL=${HN_BASE_URL}
+      - SCRAPE_TOP_N=${SCRAPE_TOP_N}
     ports:
-      - "8000:8000"
+      - "${API_PORT}:${API_PORT}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -101,14 +148,14 @@ services:
       target: worker
     container_name: hn_worker
     environment:
-      - DB_HOST=postgres
-      - DB_PORT=5432
+      - DB_HOST=${POSTGRES_HOST}
+      - DB_PORT=${POSTGRES_PORT}
       - DB_NAME=${POSTGRES_DB}
       - DB_USER=${POSTGRES_USER}
       - DB_PASSWORD=${POSTGRES_PASSWORD}
-      - TEMPORAL_HOST=temporal
-      - TEMPORAL_PORT=7233
-      - TEMPORAL_NAMESPACE=default
+      - TEMPORAL_HOST=${TEMPORAL_HOST}
+      - TEMPORAL_PORT=${TEMPORAL_PORT}
+      - TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE}
       - TEMPORAL_TASK_QUEUE=${TEMPORAL_TASK_QUEUE}
       - SERVICE_NAME=worker
       - LOG_LEVEL=${LOG_LEVEL}
@@ -119,6 +166,8 @@ services:
         condition: service_healthy
       temporal:
         condition: service_started
+      temporal-admin-setup:
+        condition: service_completed_successfully
     restart: on-failure
     networks:
       - hn_net
