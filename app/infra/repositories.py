@@ -18,7 +18,7 @@ What repositories do NOT do:
 
 Classes:
     StoryRepository      — upsert_many(), list()
-    ScrapeRunRepository  — create(), update(), list()
+    ScrapeRunRepository  — create(), update(), list(), get_by_workflow_id()
 """
 
 from __future__ import annotations
@@ -133,12 +133,16 @@ class StoryRepository:
         self,
         limit: int = 50,
         min_points: Optional[int] = None,
+        rank_min: Optional[int] = None,
+        rank_max: Optional[int] = None,
     ) -> list[Story]:
         """Return stories ordered by rank ascending.
 
         Args:
             limit:      Maximum number of stories to return (1–200).
             min_points: If provided, exclude stories with fewer points.
+            rank_min:   If provided, only return stories with rank >= this value.
+            rank_max:   If provided, only return stories with rank <= this value.
 
         Returns:
             List of Story domain models, ordered by rank ascending.
@@ -150,6 +154,12 @@ class StoryRepository:
 
         if min_points is not None:
             stmt = stmt.where(stories_table.c.points >= min_points)
+
+        if rank_min is not None:
+            stmt = stmt.where(stories_table.c.rank >= rank_min)
+
+        if rank_max is not None:
+            stmt = stmt.where(stories_table.c.rank <= rank_max)
 
         stmt = stmt.limit(limit)
 
@@ -261,11 +271,16 @@ class ScrapeRunRepository:
 
         return _row_to_scrape_run(row)
 
-    async def list(self, limit: int = 50) -> list[ScrapeRun]:
+    async def list(
+        self,
+        limit: int = 50,
+        status: Optional[ScrapeRunStatus] = None,
+    ) -> list[ScrapeRun]:
         """Return scrape runs ordered by started_at descending (most recent first).
 
         Args:
-            limit: Maximum number of runs to return (1–200).
+            limit:  Maximum number of runs to return (1–200).
+            status: If provided, only return runs with this lifecycle status.
 
         Returns:
             List of ScrapeRun domain models.
@@ -276,10 +291,36 @@ class ScrapeRunRepository:
         stmt = (
             sa.select(scrape_runs_table)
             .order_by(scrape_runs_table.c.started_at.desc())
-            .limit(limit)
         )
+
+        if status is not None:
+            stmt = stmt.where(scrape_runs_table.c.status == status.value)
+
+        stmt = stmt.limit(limit)
 
         async with get_connection() as conn:
             result = await conn.execute(stmt)
 
         return [_row_to_scrape_run(row) for row in result.fetchall()]
+
+    async def get_by_workflow_id(self, workflow_id: str) -> Optional[ScrapeRun]:
+        """Return the scrape run associated with a Temporal workflow execution ID.
+
+        Args:
+            workflow_id: Temporal workflow execution ID (as returned by POST /scrape).
+
+        Returns:
+            ScrapeRun domain model if found, None otherwise.
+
+        Raises:
+            sqlalchemy.exc.SQLAlchemyError: Propagated to caller.
+        """
+        stmt = sa.select(scrape_runs_table).where(
+            scrape_runs_table.c.workflow_id == workflow_id
+        )
+
+        async with get_connection() as conn:
+            result = await conn.execute(stmt)
+
+        row = result.fetchone()
+        return _row_to_scrape_run(row) if row is not None else None

@@ -27,7 +27,8 @@ router = APIRouter(prefix="/stories", tags=["stories"])
     summary="List scraped stories",
     description=(
         "Returns stored Hacker News stories ordered by rank ascending. "
-        "Use `limit` to cap the result count and `min_points` to filter by score."
+        "Use `limit` to cap the result count, `min_points` to filter by score, "
+        "and `rank_min` / `rank_max` to restrict to a rank range (inclusive)."
     ),
 )
 async def list_stories(
@@ -36,6 +37,12 @@ async def list_stories(
     min_points: Optional[int] = Query(
         default=None, ge=0, description="Exclude stories with fewer points than this."
     ),
+    rank_min: Optional[int] = Query(
+        default=None, ge=1, description="Only return stories with rank >= this value."
+    ),
+    rank_max: Optional[int] = Query(
+        default=None, ge=1, description="Only return stories with rank <= this value."
+    ),
 ) -> StoriesResponse:
     """Return stored stories, ordered by rank ascending.
 
@@ -43,25 +50,41 @@ async def list_stories(
         repo:       StoryRepository (injected).
         limit:      Maximum number of stories to return (1–200).
         min_points: Minimum points filter (inclusive).
+        rank_min:   Lower bound of rank range filter (inclusive).
+        rank_max:   Upper bound of rank range filter (inclusive).
 
     Returns:
         StoriesResponse containing a list of stories and their count.
 
     Raises:
+        HTTPException 400: rank_min is greater than rank_max.
         HTTPException 503: Transient database error.
         HTTPException 500: Unexpected database error.
     """
+    if rank_min is not None and rank_max is not None and rank_min > rank_max:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"rank_min ({rank_min}) must not be greater than rank_max ({rank_max}).",
+        )
+
     log = structlog.get_logger().bind(
         service=constants.SERVICE_NAME,
         endpoint="/stories",
         limit=limit,
         min_points=min_points,
+        rank_min=rank_min,
+        rank_max=rank_max,
     )
 
     log.info("api.stories.request", status="starting")
 
     try:
-        stories = await repo.list(limit=limit, min_points=min_points)
+        stories = await repo.list(
+            limit=limit,
+            min_points=min_points,
+            rank_min=rank_min,
+            rank_max=rank_max,
+        )
     except PersistenceTransientError as exc:
         log.error(
             "api.stories.db_transient_error",
