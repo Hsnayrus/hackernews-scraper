@@ -1,0 +1,30 @@
+# Virtual environments
+.venv
+
+# Editor / IDE
+.vscode
+.idea
+
+# Claude
+.claude
+.memory
+
+# Environment — never commit secrets
+.env
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Type checker / linter caches
+.mypy_cache/
+.ruff_cache/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/

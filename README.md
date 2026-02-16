@@ -6,6 +6,7 @@ Production-grade Hacker News scraping service using Python 3.12, Playwright, Tem
 
 - Docker and Docker Compose v2
 - Python 3.12+ (for local development only)
+- [uv](https://docs.astral.sh/uv/) (Python package manager)
 
 ---
 
@@ -59,8 +60,11 @@ curl http://localhost:8000/health
 ### Install dependencies
 
 ```bash
-pip install -e ".[dev]"
+uv sync --group dev
 ```
+
+This creates `.venv/` and installs all production and dev dependencies.
+`uv.lock` is generated on first run and should be committed to version control.
 
 ### Set required environment variables
 
