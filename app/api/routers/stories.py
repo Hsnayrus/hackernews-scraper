@@ -33,7 +33,8 @@ router = APIRouter(prefix="/stories", tags=["stories"])
 )
 async def list_stories(
     repo: StoryRepoDep,
-    limit: int = Query(default=50, ge=1, le=200, description="Maximum stories to return."),
+    limit: int = Query(default=10000, ge=1, le=10000,
+                       description="Maximum stories to return."),
     min_points: Optional[int] = Query(
         default=None, ge=0, description="Exclude stories with fewer points than this."
     ),
@@ -48,7 +49,7 @@ async def list_stories(
 
     Args:
         repo:       StoryRepository (injected).
-        limit:      Maximum number of stories to return (1–200).
+        limit:      Maximum number of stories to return (1-10000).
         min_points: Minimum points filter (inclusive).
         rank_min:   Lower bound of rank range filter (inclusive).
         rank_max:   Upper bound of rank range filter (inclusive).

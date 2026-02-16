@@ -76,7 +76,7 @@ class ScrapeHackerNewsWorkflow:
         - Re-raise exception so Temporal marks workflow as failed
 
     Input:
-        top_n: Number of top stories to scrape (1-100).
+        top_n: Number of top stories to scrape.
 
     Returns:
         The final ScrapeRun record with execution metadata.
@@ -161,7 +161,8 @@ class ScrapeHackerNewsWorkflow:
             # ---------------------------------------------------------------
             # Step 4: Scrape stories (with pagination when top_n > 30)
             # ---------------------------------------------------------------
-            pages_needed = (top_n + HN_STORIES_PER_PAGE - 1) // HN_STORIES_PER_PAGE
+            pages_needed = (top_n + HN_STORIES_PER_PAGE -
+                            1) // HN_STORIES_PER_PAGE
             logger.info(
                 f"Scraping stories: workflow_id={wf_id}, top_n={top_n}, "
                 f"pages_needed={pages_needed}"
@@ -316,7 +317,8 @@ class ScrapeHackerNewsWorkflow:
                         args=[
                             run_id,
                             ScrapeRunStatus.FAILED.value,
-                            salvaged_count,  # stories_scraped (None if nothing salvaged)
+                            # stories_scraped (None if nothing salvaged)
+                            salvaged_count,
                             str(exc),  # error_message
                         ],
                         start_to_close_timeout=DB_ACTIVITY_TIMEOUT,

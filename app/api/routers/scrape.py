@@ -66,7 +66,7 @@ async def trigger_scrape(
         Response containing workflow_id and status="STARTED".
 
     Raises:
-        HTTPException 422: Invalid num_stories value (not 1-120).
+        HTTPException 422: Invalid num_stories value.
         HTTPException 500: Temporal workflow start failed.
         HTTPException 503: Temporal service unavailable.
     """

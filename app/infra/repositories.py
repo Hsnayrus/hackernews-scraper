@@ -51,7 +51,8 @@ def _row_to_story(row: sa.engine.Row) -> Story:  # type: ignore[type-arg]
     )
 
 
-def _row_to_scrape_run(row: sa.engine.Row) -> ScrapeRun:  # type: ignore[type-arg]
+# type: ignore[type-arg]
+def _row_to_scrape_run(row: sa.engine.Row) -> ScrapeRun:
     """Map a SQLAlchemy result row to a ScrapeRun domain model."""
     return ScrapeRun(
         id=row.id,
@@ -139,7 +140,7 @@ class StoryRepository:
         """Return stories ordered by rank ascending.
 
         Args:
-            limit:      Maximum number of stories to return (1–200).
+            limit:      Maximum number of stories to return (1-10000).
             min_points: If provided, exclude stories with fewer points.
             rank_min:   If provided, only return stories with rank >= this value.
             rank_max:   If provided, only return stories with rank <= this value.
