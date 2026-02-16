@@ -18,7 +18,7 @@ import structlog
 from fastapi import FastAPI
 from temporalio.client import Client
 
-from app.api.routers import scrape_router
+from app.api.routers import runs_router, scrape_router, stories_router
 from app.config import constants
 
 
@@ -120,6 +120,8 @@ app = FastAPI(
 
 # Register routers
 app.include_router(scrape_router)
+app.include_router(stories_router)
+app.include_router(runs_router)
 
 
 @app.get("/health")

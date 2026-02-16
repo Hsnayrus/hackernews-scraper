@@ -86,7 +86,7 @@ async def main() -> None:
             browser_activities.start_playwright_activity,
             browser_activities.navigate_to_hacker_news_activity,
             browser_activities.scrape_urls_activity,
-            # Database persistence activities (stub)
+            # Database persistence activities
             persistence_activities.create_scrape_run_activity,
             persistence_activities.upsert_stories_activity,
             persistence_activities.update_scrape_run_activity,

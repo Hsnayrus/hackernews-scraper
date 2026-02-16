@@ -10,7 +10,9 @@ Hierarchy:
     │   ├── BrowserStartError      — failure to launch or initialise the browser
     │   └── BrowserNavigationError — failure to navigate to a target URL
     ├── ParseError                  — unexpected DOM structure during scraping
-    └── (future: PersistenceError, …)
+    └── PersistenceError            — database persistence errors
+        ├── PersistenceTransientError    — transient, safe to retry
+        └── PersistenceValidationError   — non-retryable, indicates a bug
 
 Rules:
 - No bare `except` anywhere in the codebase — always catch a specific type.
@@ -84,4 +86,41 @@ class ParseError(HackerNewsScraperError):
     failure on every attempt. The activity wraps this in
     `ApplicationError(non_retryable=True)` before raising to Temporal so
     that the workflow fails immediately rather than exhausting retry budget.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Persistence errors
+# ---------------------------------------------------------------------------
+
+
+class PersistenceError(HackerNewsScraperError):
+    """Base class for all database persistence errors."""
+
+
+class PersistenceTransientError(PersistenceError):
+    """Transient database error that is safe to retry.
+
+    This covers:
+    - Connection pool exhaustion (asyncpg.TooManyConnectionsError)
+    - Connection lost mid-operation (asyncpg.InterfaceError)
+    - Deadlock or lock timeout (asyncpg.DeadlockDetectedError)
+    - Generic SQLAlchemy OperationalError
+
+    Temporal will retry activities raising this exception using the
+    configured DB_RETRY_POLICY.
+    """
+
+
+class PersistenceValidationError(PersistenceError):
+    """Non-retryable database error indicating a programming or schema bug.
+
+    This covers:
+    - Unexpected unique constraint violations (not handled by upsert logic)
+    - Foreign key violations
+    - Not-null constraint violations on required fields
+    - Row not found when an update was expected to match
+
+    The activity wraps this in `ApplicationError(non_retryable=True)` before
+    raising to Temporal so the workflow fails immediately.
     """

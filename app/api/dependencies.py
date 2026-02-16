@@ -2,22 +2,29 @@
 
 Dependencies are injected via function parameters using `Depends()`. This
 pattern enables:
-  - Clean separation between infrastructure (Temporal client) and handlers
-  - Easy testing (swap real client for mock)
-  - Explicit lifecycle management (client stored in app.state)
+  - Clean separation between infrastructure and route handlers
+  - Easy test substitution (swap real repo/client for mock)
+  - Explicit lifecycle management (Temporal client stored in app.state)
 
 Example usage:
-    @router.post("/scrape")
-    async def trigger_scrape(
-        client: Annotated[Client, Depends(get_temporal_client)]
+    @router.get("/stories")
+    async def list_stories(
+        repo: StoryRepoDep,
     ):
-        # Use client here
+        return await repo.list()
 """
 
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
 from temporalio.client import Client
+
+from app.infra.repositories import ScrapeRunRepository, StoryRepository
+
+
+# ---------------------------------------------------------------------------
+# Temporal client
+# ---------------------------------------------------------------------------
 
 
 def get_temporal_client(request: Request) -> Client:
@@ -49,3 +56,27 @@ def get_temporal_client(request: Request) -> Client:
 
 # Type alias for use in route handler signatures
 TemporalClientDep = Annotated[Client, Depends(get_temporal_client)]
+
+
+# ---------------------------------------------------------------------------
+# Database repositories
+#
+# Repositories are stateless — instantiating one per request is cheap and
+# ensures no cross-request state leakage. The underlying AsyncEngine (and
+# its connection pool) is a module-level singleton shared across all requests.
+# ---------------------------------------------------------------------------
+
+
+def get_story_repository() -> StoryRepository:
+    """Dependency that provides a StoryRepository instance."""
+    return StoryRepository()
+
+
+def get_scrape_run_repository() -> ScrapeRunRepository:
+    """Dependency that provides a ScrapeRunRepository instance."""
+    return ScrapeRunRepository()
+
+
+# Type aliases for use in route handler signatures
+StoryRepoDep = Annotated[StoryRepository, Depends(get_story_repository)]
+ScrapeRunRepoDep = Annotated[ScrapeRunRepository, Depends(get_scrape_run_repository)]
