@@ -11,6 +11,7 @@ import logging
 
 import structlog
 from temporalio.client import Client
+from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Worker
 
 from app.activities.browser import BrowserActivities
@@ -68,6 +69,7 @@ async def main() -> None:
     client = await Client.connect(
         constants.TEMPORAL_ADDRESS,
         namespace=constants.TEMPORAL_NAMESPACE,
+        data_converter=pydantic_data_converter,
     )
 
     browser_activities = BrowserActivities()

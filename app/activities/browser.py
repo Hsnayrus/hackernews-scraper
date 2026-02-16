@@ -537,8 +537,9 @@ class BrowserActivities:
         """
         assert self._page is not None
 
+        # Use attribute selector instead of ID selector to handle numeric IDs
         subtext = await self._page.query_selector(
-            f"tr.athing#{hn_id} + tr td.subtext"
+            f"tr.athing[id='{hn_id}'] + tr td.subtext"
         )
         if subtext is None:
             return 0, "", 0

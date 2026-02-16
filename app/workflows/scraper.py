@@ -95,11 +95,7 @@ class ScrapeHackerNewsWorkflow:
         wf_id = workflow.info().workflow_id
         logger = workflow.logger
 
-        logger.info(
-            "Workflow starting",
-            workflow_id=wf_id,
-            top_n=top_n,
-        )
+        logger.info(f"Workflow starting: workflow_id={wf_id}, top_n={top_n}")
 
         # Track the scrape run ID so we can update it on success or failure.
         run_id: Optional[UUID] = None
@@ -109,28 +105,31 @@ class ScrapeHackerNewsWorkflow:
             # ---------------------------------------------------------------
             # Step 1: Create scrape run record
             # ---------------------------------------------------------------
-            logger.info("Creating scrape run record", workflow_id=wf_id)
+            logger.info(f"Creating scrape run record: workflow_id={wf_id}")
 
-            scrape_run = await workflow.execute_activity_method(
+            scrape_run_data = await workflow.execute_activity_method(
                 # Activity method name (stub for now)
                 "create_scrape_run_activity",
                 args=[wf_id],
                 start_to_close_timeout=DB_ACTIVITY_TIMEOUT,
                 retry_policy=DB_RETRY_POLICY,
             )
+            # Temporal serializes Pydantic models as dicts - reconstruct the object
+            if isinstance(scrape_run_data, dict):
+                scrape_run = ScrapeRun(**scrape_run_data)
+            else:
+                scrape_run = scrape_run_data
             run_id = scrape_run.id
 
             logger.info(
-                "Scrape run created",
-                workflow_id=wf_id,
-                run_id=str(run_id),
-                status=scrape_run.status.value,
+                f"Scrape run created: workflow_id={wf_id}, run_id={run_id}, "
+                f"status={scrape_run.status.value}"
             )
 
             # ---------------------------------------------------------------
             # Step 2: Start Playwright browser
             # ---------------------------------------------------------------
-            logger.info("Starting browser", workflow_id=wf_id)
+            logger.info(f"Starting browser: workflow_id={wf_id}")
 
             await workflow.execute_activity_method(
                 "start_playwright_activity",
@@ -138,12 +137,12 @@ class ScrapeHackerNewsWorkflow:
                 retry_policy=BROWSER_RETRY_POLICY,
             )
 
-            logger.info("Browser started", workflow_id=wf_id)
+            logger.info(f"Browser started: workflow_id={wf_id}")
 
             # ---------------------------------------------------------------
             # Step 3: Navigate to Hacker News
             # ---------------------------------------------------------------
-            logger.info("Navigating to Hacker News", workflow_id=wf_id)
+            logger.info(f"Navigating to Hacker News: workflow_id={wf_id}")
 
             await workflow.execute_activity_method(
                 "navigate_to_hacker_news_activity",
@@ -151,16 +150,13 @@ class ScrapeHackerNewsWorkflow:
                 retry_policy=BROWSER_RETRY_POLICY,
             )
 
-            logger.info("Navigation completed", workflow_id=wf_id)
+            logger.info(f"Navigation completed: workflow_id={wf_id}")
 
             # ---------------------------------------------------------------
             # Step 4: Scrape stories
             # ---------------------------------------------------------------
             logger.info(
-                "Scraping stories",
-                workflow_id=wf_id,
-                top_n=top_n,
-            )
+                f"Scraping stories: workflow_id={wf_id}, top_n={top_n}")
 
             stories: list[Story] = await workflow.execute_activity_method(
                 "scrape_urls_activity",
@@ -170,19 +166,13 @@ class ScrapeHackerNewsWorkflow:
 
             stories_count = len(stories)
             logger.info(
-                "Stories scraped",
-                workflow_id=wf_id,
-                stories_count=stories_count,
-            )
+                f"Stories scraped: workflow_id={wf_id}, stories_count={stories_count}")
 
             # ---------------------------------------------------------------
             # Step 5: Persist stories to database
             # ---------------------------------------------------------------
             logger.info(
-                "Persisting stories",
-                workflow_id=wf_id,
-                stories_count=stories_count,
-            )
+                f"Persisting stories: workflow_id={wf_id}, stories_count={stories_count}")
 
             upserted_count: int = await workflow.execute_activity_method(
                 "upsert_stories_activity",
@@ -192,17 +182,15 @@ class ScrapeHackerNewsWorkflow:
             )
 
             logger.info(
-                "Stories persisted",
-                workflow_id=wf_id,
-                upserted_count=upserted_count,
-            )
+                f"Stories persisted: workflow_id={wf_id}, upserted_count={upserted_count}")
 
             # ---------------------------------------------------------------
             # Step 6: Update scrape run status to COMPLETED
             # ---------------------------------------------------------------
-            logger.info("Updating scrape run to COMPLETED", workflow_id=wf_id)
+            logger.info(
+                f"Updating scrape run to COMPLETED: workflow_id={wf_id}")
 
-            scrape_run = await workflow.execute_activity_method(
+            scrape_run_data = await workflow.execute_activity_method(
                 "update_scrape_run_activity",
                 args=[
                     run_id,
@@ -213,12 +201,14 @@ class ScrapeHackerNewsWorkflow:
                 start_to_close_timeout=DB_ACTIVITY_TIMEOUT,
                 retry_policy=DB_RETRY_POLICY,
             )
+            if isinstance(scrape_run_data, dict):
+                scrape_run = ScrapeRun(**scrape_run_data)
+            else:
+                scrape_run = scrape_run_data
 
             logger.info(
-                "Workflow completed successfully",
-                workflow_id=wf_id,
-                run_id=str(run_id),
-                stories_scraped=upserted_count,
+                f"Workflow completed successfully: workflow_id={wf_id}, run_id={run_id}, "
+                f"stories_scraped={upserted_count}"
             )
 
             return scrape_run
@@ -227,16 +217,13 @@ class ScrapeHackerNewsWorkflow:
             # Workflow failed — update scrape run status to FAILED if we
             # have a run_id (i.e., if the run record was created before failure).
             logger.error(
-                "Workflow failed",
-                workflow_id=wf_id,
-                run_id=str(run_id) if run_id else None,
-                error=str(exc),
-                error_type=type(exc).__name__,
+                f"Workflow failed: workflow_id={wf_id}, run_id={run_id if run_id else None}, "
+                f"error_type={type(exc).__name__}, error={str(exc)}"
             )
 
             if run_id is not None:
                 try:
-                    scrape_run = await workflow.execute_activity_method(
+                    scrape_run_data = await workflow.execute_activity_method(
                         "update_scrape_run_activity",
                         args=[
                             run_id,
@@ -247,14 +234,16 @@ class ScrapeHackerNewsWorkflow:
                         start_to_close_timeout=DB_ACTIVITY_TIMEOUT,
                         retry_policy=DB_RETRY_POLICY,
                     )
+                    if isinstance(scrape_run_data, dict):
+                        scrape_run = ScrapeRun(**scrape_run_data)
+                    else:
+                        scrape_run = scrape_run_data
                 except Exception as update_exc:  # noqa: BLE001
                     # Best effort — if updating run status fails, log but
                     # don't mask the original error.
                     logger.error(
-                        "Failed to update scrape run status",
-                        workflow_id=wf_id,
-                        run_id=str(run_id),
-                        error=str(update_exc),
+                        f"Failed to update scrape run status: workflow_id={wf_id}, "
+                        f"run_id={run_id}, error={str(update_exc)}"
                     )
 
             # Re-raise the original exception so Temporal marks workflow as failed.
