@@ -132,7 +132,7 @@ class StoryRepository:
 
     async def list(
         self,
-        limit: int = 50,
+        limit: Optional[int] = None,
         min_points: Optional[int] = None,
         rank_min: Optional[int] = None,
         rank_max: Optional[int] = None,
@@ -140,7 +140,7 @@ class StoryRepository:
         """Return stories ordered by rank ascending.
 
         Args:
-            limit:      Maximum number of stories to return (1-10000).
+            limit:      Maximum number of stories to return. None returns all.
             min_points: If provided, exclude stories with fewer points.
             rank_min:   If provided, only return stories with rank >= this value.
             rank_max:   If provided, only return stories with rank <= this value.
@@ -162,7 +162,8 @@ class StoryRepository:
         if rank_max is not None:
             stmt = stmt.where(stories_table.c.rank <= rank_max)
 
-        stmt = stmt.limit(limit)
+        if limit is not None:
+            stmt = stmt.limit(limit)
 
         async with get_connection() as conn:
             result = await conn.execute(stmt)
@@ -274,13 +275,13 @@ class ScrapeRunRepository:
 
     async def list(
         self,
-        limit: int = 50,
+        limit: Optional[int] = None,
         status: Optional[ScrapeRunStatus] = None,
     ) -> list[ScrapeRun]:
         """Return scrape runs ordered by started_at descending (most recent first).
 
         Args:
-            limit:  Maximum number of runs to return (1–200).
+            limit:  Maximum number of runs to return. None returns all.
             status: If provided, only return runs with this lifecycle status.
 
         Returns:
@@ -297,7 +298,8 @@ class ScrapeRunRepository:
         if status is not None:
             stmt = stmt.where(scrape_runs_table.c.status == status.value)
 
-        stmt = stmt.limit(limit)
+        if limit is not None:
+            stmt = stmt.limit(limit)
 
         async with get_connection() as conn:
             result = await conn.execute(stmt)

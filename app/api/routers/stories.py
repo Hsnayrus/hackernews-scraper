@@ -26,15 +26,16 @@ router = APIRouter(prefix="/stories", tags=["stories"])
     status_code=status.HTTP_200_OK,
     summary="List scraped stories",
     description=(
-        "Returns stored Hacker News stories ordered by rank ascending. "
+        "Returns all stored Hacker News stories ordered by rank ascending. "
         "Use `limit` to cap the result count, `min_points` to filter by score, "
         "and `rank_min` / `rank_max` to restrict to a rank range (inclusive)."
     ),
 )
 async def list_stories(
     repo: StoryRepoDep,
-    limit: int = Query(default=10000, ge=1, le=10000,
-                       description="Maximum stories to return."),
+    limit: Optional[int] = Query(
+        default=None, ge=1, description="Maximum stories to return. If not provided, returns all stories."
+    ),
     min_points: Optional[int] = Query(
         default=None, ge=0, description="Exclude stories with fewer points than this."
     ),
@@ -49,7 +50,7 @@ async def list_stories(
 
     Args:
         repo:       StoryRepository (injected).
-        limit:      Maximum number of stories to return (1-10000).
+        limit:      Maximum number of stories to return. None returns all.
         min_points: Minimum points filter (inclusive).
         rank_min:   Lower bound of rank range filter (inclusive).
         rank_max:   Upper bound of rank range filter (inclusive).
