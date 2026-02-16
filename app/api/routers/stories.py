@@ -33,7 +33,8 @@ router = APIRouter(prefix="/stories", tags=["stories"])
 )
 async def list_stories(
     repo: StoryRepoDep,
-    limit: int = Query(default=50, ge=1, le=200, description="Maximum stories to return."),
+    limit: int = Query(default=1000, ge=1, le=1000,
+                       description="Maximum stories to return."),
     min_points: Optional[int] = Query(
         default=None, ge=0, description="Exclude stories with fewer points than this."
     ),
