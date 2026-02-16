@@ -105,6 +105,29 @@ services:
     restart: "no"
 
   # ---------------------------------------------------------------------------
+  # migrate — one-shot init container that runs `alembic upgrade head`.
+  # api and worker must not start until this completes successfully.
+  # ---------------------------------------------------------------------------
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: migrate
+    container_name: hn_migrate
+    environment:
+      - DB_HOST=${POSTGRES_HOST}
+      - DB_PORT=${POSTGRES_PORT}
+      - DB_NAME=${POSTGRES_DB}
+      - DB_USER=${POSTGRES_USER}
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - hn_net
+
+  # ---------------------------------------------------------------------------
   # api — FastAPI HTTP service.
   # ---------------------------------------------------------------------------
   api:
@@ -134,6 +157,8 @@ services:
         condition: service_healthy
       temporal:
         condition: service_started
+      migrate:
+        condition: service_completed_successfully
     restart: on-failure
     networks:
       - hn_net
@@ -167,6 +192,8 @@ services:
       temporal:
         condition: service_started
       temporal-admin-setup:
+        condition: service_completed_successfully
+      migrate:
         condition: service_completed_successfully
     restart: on-failure
     networks:

@@ -1,17 +1,29 @@
 """Alembic migration environment.
 
-DATABASE_SYNC_URL is sourced from app.config.constants (which reads
-os.environ) to enforce the project-wide env-var config pattern.
-All required environment variables must be set before running alembic.
+DATABASE_SYNC_URL is constructed directly from the DB-specific environment
+variables (DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD).
+
+Intentionally does NOT import app.config.constants — that module requires all
+application env vars (including Temporal config) to be present at import time,
+which is not the case when running migrations in an isolated init container.
 """
 
+import os
 from logging.config import fileConfig
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from app.config.constants import DATABASE_SYNC_URL
 from app.infra.db import metadata
+
+DATABASE_SYNC_URL: str = (
+    f"postgresql://{os.environ['DB_USER']}:{os.environ['DB_PASSWORD']}"
+    f"@{os.environ['DB_HOST']}:{os.environ['DB_PORT']}/{os.environ['DB_NAME']}"
+)
+
+# Import tables module so Table() constructors execute and register against
+# metadata. Without this import, metadata is empty at autogenerate time.
+import app.infra.tables  # noqa: F401, E402
 
 alembic_config = context.config
 

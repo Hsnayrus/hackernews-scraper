@@ -39,6 +39,17 @@ RUN uv pip install --system .
 COPY app/ ./app/
 
 # =============================================================================
+# Stage: migrate — runs Alembic migrations as a one-shot init container.
+#   Based on base (no browser binaries needed).
+# =============================================================================
+FROM base AS migrate
+
+COPY alembic/ ./alembic/
+COPY alembic.ini .
+
+CMD ["alembic", "upgrade", "head"]
+
+# =============================================================================
 # Stage: api — serves the FastAPI application.
 #   Does NOT include Playwright browser binaries.
 # =============================================================================
