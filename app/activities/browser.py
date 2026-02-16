@@ -13,10 +13,11 @@ State layout:
     └── _page:       Page | None
 
 Activity chain (in workflow order):
-    1. start_playwright_activity      ← this module (initialises browser)
-    2. navigate_to_hacker_news_activity
-    3. scrape_urls_activity
-    4. navigate_to_next_page_activity
+    1. start_playwright_activity           ← this module (initialises browser)
+    2. navigate_to_hacker_news_activity    ← navigates to HN page 1
+    3. scrape_urls_activity                ← scrapes current page
+    4. navigate_to_next_page_activity      ← navigates to page N (when top_n > 30)
+       [3–4 repeat for each additional page]
 
 Worker-restart resilience (Option A):
     Every activity that needs the browser calls `await self._ensure_browser()`
@@ -77,6 +78,14 @@ NAVIGATE_TIMEOUT = timedelta(minutes=1)
 #: Time budget for a single attempt of scrape_urls_activity.
 #: Covers DOM querying and parsing for up to SCRAPE_TOP_N story rows.
 SCRAPE_TIMEOUT = timedelta(minutes=2)
+
+#: Time budget for a single attempt of navigate_to_next_page_activity.
+#: Same budget as NAVIGATE_TIMEOUT — identical network operation, different URL.
+NAVIGATE_TO_NEXT_PAGE_TIMEOUT = NAVIGATE_TIMEOUT
+
+#: Number of stories Hacker News renders per results page.
+#: This is a fixed property of the HN site, not a configurable parameter.
+HN_STORIES_PER_PAGE: int = 30
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +419,202 @@ class BrowserActivities:
             duration_ms=duration_ms,
         )
         return stories
+
+    @activity.defn(name="navigate_to_next_page_activity")
+    async def navigate_to_next_page_activity(self, page_number: int) -> bool:
+        """Navigate the browser to the specified Hacker News results page.
+
+        Fourth activity in the scrape workflow. Navigates directly to
+        ``{HN_BASE_URL}?p={page_number}``, waits for the DOM to be ready, and
+        verifies the page is a valid HN front page with story rows.
+
+        Called only when ``top_n > HN_STORIES_PER_PAGE``. Page 1 is loaded by
+        ``navigate_to_hacker_news_activity``; this activity is invoked for
+        pages 2, 3, … in sequence, once per additional page needed.
+
+        ``_ensure_browser()`` is called at entry so the activity is resilient to
+        worker restart between page transitions.
+
+        Args:
+            page_number: 1-indexed HN page to navigate to. Must be >= 2.
+
+        Returns:
+            True when the browser is positioned on the loaded target page.
+
+        Raises:
+            ApplicationError(non_retryable=True): ``page_number < 2``
+                (contract violation — caller logic error) or Playwright binary
+                not found (infra misconfiguration).
+            BrowserStartError: Browser could not be (re-)launched (retryable).
+            BrowserNavigationError: Navigation or page verification failed
+                (retryable). A failure screenshot is captured before raising.
+        """
+        info = activity.info()
+        log = structlog.get_logger().bind(
+            service=constants.SERVICE_NAME,
+            activity_name=info.activity_type,
+            workflow_id=info.workflow_id,
+            run_id=info.workflow_run_id,
+            activity_id=info.activity_id,
+        )
+
+        if page_number < 2:
+            raise ApplicationError(
+                f"navigate_to_next_page_activity requires page_number >= 2, "
+                f"got {page_number}",
+                non_retryable=True,
+            )
+
+        target_url = f"{constants.HN_BASE_URL}?p={page_number}"
+        log.info(
+            "pagination.starting",
+            status="starting",
+            url=target_url,
+            page_number=page_number,
+        )
+        started_at = time.monotonic()
+
+        try:
+            await self._ensure_browser(log=log)
+        except ApplicationError:
+            raise
+        except BrowserStartError as exc:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            log.error(
+                "pagination.failed",
+                status="failed",
+                reason="browser_unavailable",
+                page_number=page_number,
+                error=str(exc),
+                duration_ms=duration_ms,
+            )
+            raise
+
+        assert self._page is not None
+
+        try:
+            response = await self._page.goto(
+                target_url,
+                wait_until="domcontentloaded",
+                timeout=constants.BROWSER_TIMEOUT_MS,
+            )
+        except PlaywrightError as exc:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            screenshot_path = await self._capture_screenshot(
+                info.activity_type, info.workflow_id
+            )
+            log.error(
+                "pagination.failed",
+                status="failed",
+                reason="goto_error",
+                url=target_url,
+                page_number=page_number,
+                error=str(exc),
+                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                duration_ms=duration_ms,
+            )
+            raise BrowserNavigationError(
+                f"Failed to navigate to HN page {page_number} ({target_url}): {exc}"
+            ) from exc
+
+        if response is not None and not response.ok:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            screenshot_path = await self._capture_screenshot(
+                info.activity_type, info.workflow_id
+            )
+            log.error(
+                "pagination.failed",
+                status="failed",
+                reason="http_error",
+                url=target_url,
+                page_number=page_number,
+                http_status=response.status,
+                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                duration_ms=duration_ms,
+            )
+            raise BrowserNavigationError(
+                f"Unexpected HTTP {response.status} from HN page {page_number} "
+                f"({target_url})"
+            )
+
+        try:
+            title = await self._page.title()
+        except PlaywrightError as exc:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            screenshot_path = await self._capture_screenshot(
+                info.activity_type, info.workflow_id
+            )
+            log.error(
+                "pagination.failed",
+                status="failed",
+                reason="title_read_error",
+                page_number=page_number,
+                error=str(exc),
+                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                duration_ms=duration_ms,
+            )
+            raise BrowserNavigationError(
+                f"Could not read page title after navigating to HN page "
+                f"{page_number}: {exc}"
+            ) from exc
+
+        if "Hacker News" not in title:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            screenshot_path = await self._capture_screenshot(
+                info.activity_type, info.workflow_id
+            )
+            log.error(
+                "pagination.failed",
+                status="failed",
+                reason="unexpected_page",
+                page_title=title,
+                url=target_url,
+                page_number=page_number,
+                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                duration_ms=duration_ms,
+            )
+            raise BrowserNavigationError(
+                f"Unexpected page title '{title}' on HN page {page_number} — "
+                "expected 'Hacker News'. Site may be returning a captcha or "
+                "error page."
+            )
+
+        try:
+            await self._page.wait_for_selector(
+                ".athing",
+                state="attached",
+                timeout=constants.BROWSER_TIMEOUT_MS,
+            )
+        except PlaywrightError as exc:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            screenshot_path = await self._capture_screenshot(
+                info.activity_type, info.workflow_id
+            )
+            log.error(
+                "pagination.failed",
+                status="failed",
+                reason="no_stories_found",
+                url=target_url,
+                page_number=page_number,
+                error=str(exc),
+                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                duration_ms=duration_ms,
+            )
+            raise BrowserNavigationError(
+                f"No story rows (.athing) found on HN page {page_number} "
+                f"({target_url}) within timeout: {exc}"
+            ) from exc
+
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        log.info(
+            "pagination.completed",
+            status="completed",
+            url=target_url,
+            page_number=page_number,
+            page_title=title,
+            duration_ms=duration_ms,
+        )
+        return True
 
     # -------------------------------------------------------------------------
     # Internal helpers

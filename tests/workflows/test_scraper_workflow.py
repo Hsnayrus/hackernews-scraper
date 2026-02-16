@@ -135,8 +135,13 @@ def _create_activity_mocks(
         """Mock: navigate to HN (no-op)."""
         pass
 
+    @activity.defn(name="navigate_to_next_page_activity")
+    async def navigate_to_next_page_activity(page_number: int) -> bool:
+        """Mock: navigate to next page (no-op)."""
+        return True
+
     @activity.defn(name="scrape_urls_activity")
-    async def scrape_urls_activity() -> list[dict[str, Any]]:
+    async def scrape_urls_activity(top_n: int) -> list[dict[str, Any]]:
         """Mock: scrape stories and return as list of dicts."""
         return [story.model_dump() for story in stories]
 
@@ -159,6 +164,7 @@ def _create_activity_mocks(
         create_scrape_run_activity,
         start_playwright_activity,
         navigate_to_hacker_news_activity,
+        navigate_to_next_page_activity,
         scrape_urls_activity,
         upsert_stories_activity,
         update_scrape_run_activity,
@@ -332,8 +338,12 @@ class TestWorkflowFailureHandling:
         async def navigate_to_hacker_news_activity() -> None:
             pass
 
+        @activity.defn(name="navigate_to_next_page_activity")
+        async def navigate_to_next_page_activity(page_number: int) -> bool:
+            return True
+
         @activity.defn(name="scrape_urls_activity")
-        async def scrape_urls_activity() -> list[dict[str, Any]]:
+        async def scrape_urls_activity(top_n: int) -> list[dict[str, Any]]:
             return []
 
         @activity.defn(name="upsert_stories_activity")
@@ -353,6 +363,7 @@ class TestWorkflowFailureHandling:
             create_scrape_run_activity_failing,
             start_playwright_activity,
             navigate_to_hacker_news_activity,
+            navigate_to_next_page_activity,
             scrape_urls_activity,
             upsert_stories_activity,
             update_scrape_run_activity,
@@ -400,8 +411,13 @@ class TestWorkflowFailureHandling:
             """Mock activity that fails."""
             raise RuntimeError("Browser navigation failed")
 
+        @activity.defn(name="navigate_to_next_page_activity")
+        async def navigate_to_next_page_activity(page_number: int) -> bool:
+            # Won't be called
+            return True
+
         @activity.defn(name="scrape_urls_activity")
-        async def scrape_urls_activity() -> list[dict[str, Any]]:
+        async def scrape_urls_activity(top_n: int) -> list[dict[str, Any]]:
             # Won't be called
             return []
 
@@ -427,6 +443,7 @@ class TestWorkflowFailureHandling:
             create_scrape_run_activity,
             start_playwright_activity,
             navigate_to_hacker_news_activity,
+            navigate_to_next_page_activity,
             scrape_urls_activity,
             upsert_stories_activity,
             update_scrape_run_activity,
@@ -480,8 +497,13 @@ class TestWorkflowFailureHandling:
         async def navigate_to_hacker_news_activity() -> None:
             pass
 
+        @activity.defn(name="navigate_to_next_page_activity")
+        async def navigate_to_next_page_activity(page_number: int) -> bool:
+            # Won't be called
+            return True
+
         @activity.defn(name="scrape_urls_activity")
-        async def scrape_urls_activity() -> list[dict[str, Any]]:
+        async def scrape_urls_activity(top_n: int) -> list[dict[str, Any]]:
             """Mock activity that fails during scraping."""
             raise RuntimeError("Failed to parse story elements")
 
@@ -512,6 +534,7 @@ class TestWorkflowFailureHandling:
             create_scrape_run_activity,
             start_playwright_activity,
             navigate_to_hacker_news_activity,
+            navigate_to_next_page_activity,
             scrape_urls_activity,
             upsert_stories_activity,
             update_scrape_run_activity,

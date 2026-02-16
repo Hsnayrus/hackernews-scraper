@@ -32,7 +32,6 @@ class ScrapeRequest(BaseModel):
     num_stories: Optional[int] = Field(
         default=None,
         ge=1,
-        le=120,
         description=(
             "Number of top stories to scrape from Hacker News. "
             "If not provided, defaults to SCRAPE_TOP_N from environment config."
