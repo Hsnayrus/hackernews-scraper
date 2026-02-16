@@ -1,0 +1,261 @@
+"""Hacker News scraping workflow.
+
+This module contains the primary workflow `ScrapeHackerNewsWorkflow`, which
+orchestrates the end-to-end scraping process:
+
+    1. Create scrape run record (database)
+    2. Launch browser
+    3. Navigate to Hacker News
+    4. Scrape top N stories
+    5. Persist stories to database
+    6. Update scrape run status
+
+The workflow is deterministic — all side effects (browser, database, logging)
+are implemented as activities. The workflow only orchestrates.
+"""
+
+from __future__ import annotations
+
+from datetime import timedelta
+from typing import Optional
+from uuid import UUID
+
+from temporalio import workflow
+from temporalio.common import RetryPolicy
+
+with workflow.unsafe.imports_passed_through():
+    from app.activities.browser import (
+        BROWSER_RETRY_POLICY,
+        BROWSER_START_TIMEOUT,
+        NAVIGATE_TIMEOUT,
+        SCRAPE_TIMEOUT,
+    )
+    from app.domain.exceptions import ParseError
+    from app.domain.models import ScrapeRun, ScrapeRunStatus, Story
+
+
+# ---------------------------------------------------------------------------
+# Activity execution options for database activities
+# ---------------------------------------------------------------------------
+
+DB_RETRY_POLICY = RetryPolicy(
+    maximum_attempts=3,
+    initial_interval=timedelta(seconds=1),
+    backoff_coefficient=2.0,
+    maximum_interval=timedelta(seconds=10),
+)
+
+DB_ACTIVITY_TIMEOUT = timedelta(seconds=30)
+
+
+# ---------------------------------------------------------------------------
+# Workflow
+# ---------------------------------------------------------------------------
+
+
+@workflow.defn(name="ScrapeHackerNewsWorkflow")
+class ScrapeHackerNewsWorkflow:
+    """Orchestrates the Hacker News scraping process using Temporal activities.
+
+    This workflow is deterministic and replay-safe. All side effects (browser
+    automation, database writes, external I/O) are isolated in activities.
+
+    Workflow execution flow:
+        1. Create ScrapeRun record (status=PENDING)
+        2. Start Playwright browser
+        3. Navigate to Hacker News homepage
+        4. Scrape top N stories from the page
+        5. Upsert stories into Postgres
+        6. Update ScrapeRun (status=COMPLETED, stories_scraped=N)
+
+    On failure:
+        - Update ScrapeRun (status=FAILED, error_message=...)
+        - Re-raise exception so Temporal marks workflow as failed
+
+    Input:
+        top_n: Number of top stories to scrape (1-100).
+
+    Returns:
+        The final ScrapeRun record with execution metadata.
+    """
+
+    @workflow.run
+    async def run(self, top_n: int) -> ScrapeRun:
+        """Execute the scraping workflow.
+
+        Args:
+            top_n: Number of top stories to scrape from HN front page.
+
+        Returns:
+            Final ScrapeRun record with status=COMPLETED or FAILED.
+
+        Raises:
+            Exception: Any unrecoverable activity failure (workflow fails).
+        """
+        wf_id = workflow.info().workflow_id
+        logger = workflow.logger
+
+        logger.info(
+            "Workflow starting",
+            workflow_id=wf_id,
+            top_n=top_n,
+        )
+
+        # Track the scrape run ID so we can update it on success or failure.
+        run_id: Optional[UUID] = None
+        scrape_run: Optional[ScrapeRun] = None
+
+        try:
+            # ---------------------------------------------------------------
+            # Step 1: Create scrape run record
+            # ---------------------------------------------------------------
+            logger.info("Creating scrape run record", workflow_id=wf_id)
+
+            scrape_run = await workflow.execute_activity_method(
+                # Activity method name (stub for now)
+                "create_scrape_run_activity",
+                args=[wf_id],
+                start_to_close_timeout=DB_ACTIVITY_TIMEOUT,
+                retry_policy=DB_RETRY_POLICY,
+            )
+            run_id = scrape_run.id
+
+            logger.info(
+                "Scrape run created",
+                workflow_id=wf_id,
+                run_id=str(run_id),
+                status=scrape_run.status.value,
+            )
+
+            # ---------------------------------------------------------------
+            # Step 2: Start Playwright browser
+            # ---------------------------------------------------------------
+            logger.info("Starting browser", workflow_id=wf_id)
+
+            await workflow.execute_activity_method(
+                "start_playwright_activity",
+                start_to_close_timeout=BROWSER_START_TIMEOUT,
+                retry_policy=BROWSER_RETRY_POLICY,
+            )
+
+            logger.info("Browser started", workflow_id=wf_id)
+
+            # ---------------------------------------------------------------
+            # Step 3: Navigate to Hacker News
+            # ---------------------------------------------------------------
+            logger.info("Navigating to Hacker News", workflow_id=wf_id)
+
+            await workflow.execute_activity_method(
+                "navigate_to_hacker_news_activity",
+                start_to_close_timeout=NAVIGATE_TIMEOUT,
+                retry_policy=BROWSER_RETRY_POLICY,
+            )
+
+            logger.info("Navigation completed", workflow_id=wf_id)
+
+            # ---------------------------------------------------------------
+            # Step 4: Scrape stories
+            # ---------------------------------------------------------------
+            logger.info(
+                "Scraping stories",
+                workflow_id=wf_id,
+                top_n=top_n,
+            )
+
+            stories: list[Story] = await workflow.execute_activity_method(
+                "scrape_urls_activity",
+                start_to_close_timeout=SCRAPE_TIMEOUT,
+                retry_policy=BROWSER_RETRY_POLICY,
+            )
+
+            stories_count = len(stories)
+            logger.info(
+                "Stories scraped",
+                workflow_id=wf_id,
+                stories_count=stories_count,
+            )
+
+            # ---------------------------------------------------------------
+            # Step 5: Persist stories to database
+            # ---------------------------------------------------------------
+            logger.info(
+                "Persisting stories",
+                workflow_id=wf_id,
+                stories_count=stories_count,
+            )
+
+            upserted_count: int = await workflow.execute_activity_method(
+                "upsert_stories_activity",
+                args=[stories],
+                start_to_close_timeout=DB_ACTIVITY_TIMEOUT,
+                retry_policy=DB_RETRY_POLICY,
+            )
+
+            logger.info(
+                "Stories persisted",
+                workflow_id=wf_id,
+                upserted_count=upserted_count,
+            )
+
+            # ---------------------------------------------------------------
+            # Step 6: Update scrape run status to COMPLETED
+            # ---------------------------------------------------------------
+            logger.info("Updating scrape run to COMPLETED", workflow_id=wf_id)
+
+            scrape_run = await workflow.execute_activity_method(
+                "update_scrape_run_activity",
+                args=[
+                    run_id,
+                    ScrapeRunStatus.COMPLETED.value,
+                    upserted_count,
+                    None,  # error_message
+                ],
+                start_to_close_timeout=DB_ACTIVITY_TIMEOUT,
+                retry_policy=DB_RETRY_POLICY,
+            )
+
+            logger.info(
+                "Workflow completed successfully",
+                workflow_id=wf_id,
+                run_id=str(run_id),
+                stories_scraped=upserted_count,
+            )
+
+            return scrape_run
+
+        except Exception as exc:
+            # Workflow failed — update scrape run status to FAILED if we
+            # have a run_id (i.e., if the run record was created before failure).
+            logger.error(
+                "Workflow failed",
+                workflow_id=wf_id,
+                run_id=str(run_id) if run_id else None,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+
+            if run_id is not None:
+                try:
+                    scrape_run = await workflow.execute_activity_method(
+                        "update_scrape_run_activity",
+                        args=[
+                            run_id,
+                            ScrapeRunStatus.FAILED.value,
+                            None,  # stories_scraped
+                            str(exc),  # error_message
+                        ],
+                        start_to_close_timeout=DB_ACTIVITY_TIMEOUT,
+                        retry_policy=DB_RETRY_POLICY,
+                    )
+                except Exception as update_exc:  # noqa: BLE001
+                    # Best effort — if updating run status fails, log but
+                    # don't mask the original error.
+                    logger.error(
+                        "Failed to update scrape run status",
+                        workflow_id=wf_id,
+                        run_id=str(run_id),
+                        error=str(update_exc),
+                    )
+
+            # Re-raise the original exception so Temporal marks workflow as failed.
+            raise

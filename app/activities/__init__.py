@@ -8,9 +8,11 @@ from app.activities.browser import (
     BROWSER_START_TIMEOUT,
     BrowserActivities,
 )
+from app.activities.persistence import PersistenceActivities
 
 __all__ = [
     "BrowserActivities",
     "BROWSER_RETRY_POLICY",
     "BROWSER_START_TIMEOUT",
+    "PersistenceActivities",
 ]
