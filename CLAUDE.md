@@ -91,4 +91,4 @@ Available tools:
 
 Use qmd search for quick lookups and qmd query for complex questions.
 
-Use Read/Glob only if qmd doesn’t return enough results.
+Use Read/Glob very sparingly. Ensure that these commands are run first and then understand if Glob/Read is required.
