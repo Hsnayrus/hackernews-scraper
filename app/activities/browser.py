@@ -440,6 +440,9 @@ class BrowserActivities:
 
         Returns:
             True when the browser is positioned on the loaded target page.
+            False when the current page has no ``a.morelink`` element, meaning
+            HN has no further pages to offer — the caller should stop
+            pagination without treating this as an error.
 
         Raises:
             ApplicationError(non_retryable=True): ``page_number < 2``
@@ -491,6 +494,42 @@ class BrowserActivities:
             raise
 
         assert self._page is not None
+
+        # Check whether the current page exposes a "More" link before
+        # navigating away.  HN renders <a class="morelink"> at the bottom of
+        # every page that has a successor.  Its absence means we've reached the
+        # last available page — return False so the workflow stops pagination
+        # without treating this as an error.
+        try:
+            more_link = await self._page.query_selector("a.morelink")
+        except PlaywrightError as exc:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            screenshot_path = await self._capture_screenshot(
+                info.activity_type, info.workflow_id
+            )
+            log.error(
+                "pagination.failed",
+                status="failed",
+                reason="morelink_query_error",
+                page_number=page_number,
+                error=str(exc),
+                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                duration_ms=duration_ms,
+            )
+            raise BrowserNavigationError(
+                f"Failed to query 'a.morelink' on HN page {page_number - 1}: {exc}"
+            ) from exc
+
+        if more_link is None:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            log.info(
+                "pagination.no_more_pages",
+                status="completed",
+                reason="no_morelink",
+                page_number=page_number,
+                duration_ms=duration_ms,
+            )
+            return False
 
         try:
             response = await self._page.goto(

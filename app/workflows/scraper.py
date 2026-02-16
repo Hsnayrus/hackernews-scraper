@@ -103,6 +103,9 @@ class ScrapeHackerNewsWorkflow:
         # Track the scrape run ID so we can update it on success or failure.
         run_id: Optional[UUID] = None
         scrape_run: Optional[ScrapeRun] = None
+        # Initialised here so the except handler can always reference it,
+        # even when the exception fires before the scraping loop is reached.
+        all_stories: list[Story] = []
 
         try:
             # ---------------------------------------------------------------
@@ -164,8 +167,6 @@ class ScrapeHackerNewsWorkflow:
                 f"pages_needed={pages_needed}"
             )
 
-            all_stories: list[Story] = []
-
             # Page 1 is already loaded by navigate_to_hacker_news_activity.
             page_1_stories: list[Story] = await workflow.execute_activity_method(
                 "scrape_urls_activity",
@@ -188,12 +189,18 @@ class ScrapeHackerNewsWorkflow:
                 logger.info(
                     f"Navigating to page {page_number}: workflow_id={wf_id}"
                 )
-                await workflow.execute_activity_method(
+                has_more: bool = await workflow.execute_activity_method(
                     "navigate_to_next_page_activity",
                     args=[page_number],
                     start_to_close_timeout=NAVIGATE_TO_NEXT_PAGE_TIMEOUT,
                     retry_policy=BROWSER_RETRY_POLICY,
                 )
+                if not has_more:
+                    logger.info(
+                        f"HN has no more pages, stopping pagination: "
+                        f"workflow_id={wf_id}, last_page={page_number - 1}"
+                    )
+                    break
 
                 page_stories: list[Story] = await workflow.execute_activity_method(
                     "scrape_urls_activity",
@@ -277,13 +284,39 @@ class ScrapeHackerNewsWorkflow:
             )
 
             if run_id is not None:
+                # Best-effort: persist any stories scraped before the failure
+                # so partial results are not lost.
+                salvaged_count: Optional[int] = None
+                if all_stories:
+                    stories_to_salvage = all_stories[:top_n]
+                    logger.info(
+                        f"Salvaging {len(stories_to_salvage)} stories before marking "
+                        f"run as FAILED: workflow_id={wf_id}"
+                    )
+                    try:
+                        salvaged_count = await workflow.execute_activity_method(
+                            "upsert_stories_activity",
+                            args=[stories_to_salvage],
+                            start_to_close_timeout=DB_ACTIVITY_TIMEOUT,
+                            retry_policy=DB_RETRY_POLICY,
+                        )
+                        logger.info(
+                            f"Salvaged {salvaged_count} stories: workflow_id={wf_id}"
+                        )
+                    except Exception as salvage_exc:  # noqa: BLE001
+                        # Best effort — don't mask the original error.
+                        logger.error(
+                            f"Failed to salvage stories on workflow failure: "
+                            f"workflow_id={wf_id}, error={str(salvage_exc)}"
+                        )
+
                 try:
                     scrape_run_data = await workflow.execute_activity_method(
                         "update_scrape_run_activity",
                         args=[
                             run_id,
                             ScrapeRunStatus.FAILED.value,
-                            None,  # stories_scraped
+                            salvaged_count,  # stories_scraped (None if nothing salvaged)
                             str(exc),  # error_message
                         ],
                         start_to_close_timeout=DB_ACTIVITY_TIMEOUT,
