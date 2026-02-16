@@ -12,46 +12,78 @@ Production-grade Hacker News scraping service using Python 3.12, Playwright, Tem
 
 ## Running with Docker Compose
 
-### 1. Set environment variables
+### 1. Copy and configure environment variables
 
 All required variables are documented in [.env.example](.env.example).
 
 ```bash
 cp .env.example .env
-# Edit .env with your values
 ```
 
-Or export them directly into your shell — Docker Compose reads from both.
+The default values in `.env.example` are production-ready for local Docker Compose usage.
+You typically **do not need to modify** `.env` unless you want to change ports or resource limits.
 
 ### 2. Start all services
 
 ```bash
-docker compose up --build
+docker compose up --build -d
 ```
 
-This starts four services:
+This single command:
 
-| Service    | Description                              | Port  |
-|------------|------------------------------------------|-------|
-| `postgres`  | Postgres 16 datastore                    | 5432  |
-| `temporal`  | Temporal server (auto-setup)             | 7233  |
-| `api`       | FastAPI HTTP service                     | 8000  |
-| `worker`    | Temporal worker with Playwright          | —     |
+- Builds Docker images for `api`, `worker`, and `migrate` services
+- Starts all infrastructure (Postgres, Temporal)
+- Runs database migrations automatically via the `migrate` init container
+- Registers the Temporal namespace via `temporal-admin-setup`
+- Starts the API and worker services
 
-Temporal auto-setup creates its own schema in Postgres on first boot (10-30s).
-The `api` and `worker` services will restart automatically until Temporal is ready.
+**Services started:**
 
-### 3. Run database migrations
+| Service                | Description                                      | Port(s)       |
+|------------------------|--------------------------------------------------|---------------|
+| `postgres`             | Postgres 16 datastore                            | 5432          |
+| `temporal`             | Temporal server (auto-setup mode)                | 7233          |
+| `temporal-ui`          | Temporal Web UI for monitoring workflows         | 8080          |
+| `temporal-admin-setup` | Init container: registers namespace (runs once)  | —             |
+| `migrate`              | Init container: runs `alembic upgrade head`      | —             |
+| `api`                  | FastAPI HTTP service                             | 8000          |
+| `worker`               | Temporal worker with Playwright                  | —             |
 
-```bash
-docker compose exec api alembic upgrade head
-```
+**Startup behavior:**
 
-### 4. Verify
+- Temporal auto-setup creates its own schemas in Postgres on first boot (10-30s)
+- The `migrate` service waits for Postgres health, then applies application migrations
+- The `api` and `worker` services start only after migrations complete successfully
+- Both `api` and `worker` use `restart: on-failure` to tolerate Temporal's startup delay
+
+### 3. Verify the system is running
+
+**Check API health:**
 
 ```bash
 curl http://localhost:8000/health
 ```
+
+Expected response:
+
+```json
+{
+  "status": "ok",
+  "service": "api"
+}
+```
+
+**Access Temporal UI:**
+
+Open [http://localhost:8080](http://localhost:8080) in your browser to monitor workflows, view execution history, and inspect activity logs.
+
+**Check running containers:**
+
+```bash
+docker compose ps
+```
+
+All services except init containers (`migrate`, `temporal-admin-setup`) should show `Up` status.
 
 ---
 
@@ -106,7 +138,7 @@ ruff check app/ tests/
 
 ## Architecture
 
-```
+```text
 app/
 ├── workflows/   # Temporal workflow definitions (deterministic — no I/O)
 ├── activities/  # All side effects: scraping, DB writes, logging
@@ -120,7 +152,7 @@ app/
 
 ### Configuration Flow
 
-```
+```text
 Host environment variables
         │
         ▼
@@ -142,9 +174,177 @@ All modules import from app.config.constants
 
 ## API Endpoints
 
-| Method | Path       | Description                  |
-|--------|------------|------------------------------|
-| `GET`  | `/health`  | Service health check         |
-| `POST` | `/scrape`  | Trigger a new scrape workflow |
-| `GET`  | `/stories` | Query stored stories          |
-| `GET`  | `/runs`    | Query scrape run history      |
+### `GET /health`
+
+Service health check.
+
+```bash
+curl http://localhost:8000/health
+```
+
+Response:
+
+```json
+{
+  "status": "ok",
+  "service": "api"
+}
+```
+
+---
+
+### `POST /scrape`
+
+Triggers a new Hacker News scraping workflow via Temporal.
+
+**Scrape with default settings (top 30 stories):**
+
+```bash
+curl -X POST http://localhost:8000/scrape
+```
+
+**Scrape a custom number of stories:**
+
+```bash
+curl -X POST http://localhost:8000/scrape \
+  -H "Content-Type: application/json" \
+  -d '{"num_stories": 50}'
+```
+
+Response:
+
+```json
+{
+  "workflow_id": "scrape-2026-02-15T10:30:45Z-a7b3c9d2",
+  "status": "STARTED"
+}
+```
+
+**Workflow execution:**
+
+- Returns immediately with workflow ID (non-blocking)
+- Workflow runs asynchronously in the Temporal worker
+- Monitor progress in Temporal UI: [http://localhost:8080](http://localhost:8080)
+
+**What happens during scrape:**
+
+1. Creates a new scrape run record in `scrape_runs` table
+2. Launches Playwright browser in headless mode
+3. Navigates to <https://news.ycombinator.com>
+4. Scrapes top 30 stories (configurable via `SCRAPE_TOP_N`)
+5. Upserts stories into `stories` table (idempotent by `hn_id`)
+6. Updates scrape run status to `COMPLETED` or `FAILED`
+
+---
+
+### `GET /stories`
+
+Returns stored stories from the database.
+
+**Query all stories (most recent first):**
+
+```bash
+curl http://localhost:8000/stories
+```
+
+**Limit results:**
+
+```bash
+curl "http://localhost:8000/stories?limit=10"
+```
+
+**Filter by minimum points:**
+
+```bash
+curl "http://localhost:8000/stories?min_points=100"
+```
+
+**Filter by rank range:**
+
+```bash
+curl "http://localhost:8000/stories?rank_min=1&rank_max=10"
+```
+
+**Combine filters:**
+
+```bash
+curl "http://localhost:8000/stories?limit=5&min_points=200&rank_min=1&rank_max=30"
+```
+
+Response:
+
+```json
+{
+  "stories": [
+    {
+      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "hn_id": "39876543",
+      "title": "Show HN: I built a thing",
+      "url": "https://example.com/my-project",
+      "rank": 1,
+      "points": 420,
+      "author": "pg",
+      "comments_count": 137,
+      "scraped_at": "2026-02-15T10:30:45.123456",
+      "created_at": "2026-02-15T10:30:45.123456"
+    }
+  ],
+  "count": 1
+}
+```
+
+---
+
+### `GET /runs`
+
+Returns metadata about previous scrape executions.
+
+**Query all runs (most recent first):**
+
+```bash
+curl http://localhost:8000/runs
+```
+
+**Limit results:**
+
+```bash
+curl "http://localhost:8000/runs?limit=10"
+```
+
+**Filter by status:**
+
+```bash
+curl "http://localhost:8000/runs?status=COMPLETED"
+```
+
+**Combine filters:**
+
+```bash
+curl "http://localhost:8000/runs?limit=5&status=FAILED"
+```
+
+Response:
+
+```json
+{
+  "runs": [
+    {
+      "id": "d4e5f6a7-b8c9-0d1e-2f3a-4b5c6d7e8f9a",
+      "workflow_id": "scrape-hn-20260215-103045-abc123",
+      "started_at": "2026-02-15T10:30:45.000000",
+      "finished_at": "2026-02-15T10:31:23.000000",
+      "status": "COMPLETED",
+      "stories_scraped": 30,
+      "error_message": null
+    }
+  ],
+  "count": 1
+}
+```
+
+**Status values:**
+
+- `PENDING` — scrape run record created, workflow not yet started
+- `RUNNING` — scraping workflow in progress
+- `COMPLETED` — all stories scraped and persisted successfully
+- `FAILED` — workflow terminated with unrecoverable error (see `error_message`)
