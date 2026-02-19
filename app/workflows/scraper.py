@@ -213,12 +213,15 @@ class ScrapeHackerNewsWorkflow:
             )
 
             # Page 1 is already loaded by navigate_to_hacker_news_activity.
-            page_1_stories: list[Story] = await workflow.execute_activity_method(
+            raw_page_1_stories = await workflow.execute_activity_method(
                 "scrape_urls_activity",
                 args=[top_n],
                 start_to_close_timeout=SCRAPE_TIMEOUT,
                 retry_policy=BROWSER_RETRY_POLICY,
             )
+            page_1_stories: list[Story] = [
+                Story(**s) if isinstance(s, dict) else s for s in raw_page_1_stories
+            ]
             all_stories.extend(page_1_stories)
             logger.info(
                 f"Page 1 scraped: workflow_id={wf_id}, "
@@ -247,12 +250,15 @@ class ScrapeHackerNewsWorkflow:
                     )
                     break
 
-                page_stories: list[Story] = await workflow.execute_activity_method(
+                raw_page_stories = await workflow.execute_activity_method(
                     "scrape_urls_activity",
                     args=[top_n],
                     start_to_close_timeout=SCRAPE_TIMEOUT,
                     retry_policy=BROWSER_RETRY_POLICY,
                 )
+                page_stories: list[Story] = [
+                    Story(**s) if isinstance(s, dict) else s for s in raw_page_stories
+                ]
 
                 if not page_stories:
                     logger.info(
