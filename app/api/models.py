@@ -69,6 +69,13 @@ class StoryResponse(BaseModel):
     points: int
     author: str
     comments_count: int
+    top_comment: Optional[str] = Field(
+        default=None,
+        description=(
+            "The top comment from the story's HN page. "
+            "None if the story has no comments or comment scraping failed."
+        ),
+    )
     scraped_at: datetime
     created_at: datetime
 
