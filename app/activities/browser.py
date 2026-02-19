@@ -18,6 +18,8 @@ Activity chain (in workflow order):
     3. scrape_urls_activity                ← scrapes current page
     4. navigate_to_next_page_activity      ← navigates to page N (when top_n > 30)
        [3–4 repeat for each additional page]
+    5. scrape_top_comment_activity         ← scrapes top comment for each story
+    6. cleanup_browser_context_activity    ← tears down workflow's context
 
 Worker-restart resilience (Option A):
     Every activity that needs the browser calls `await self._ensure_browser()`
@@ -32,6 +34,7 @@ rather than duplicating the values.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -83,9 +86,26 @@ SCRAPE_TIMEOUT = timedelta(minutes=2)
 #: Same budget as NAVIGATE_TIMEOUT — identical network operation, different URL.
 NAVIGATE_TO_NEXT_PAGE_TIMEOUT = NAVIGATE_TIMEOUT
 
+#: Time budget for a single attempt of cleanup_browser_context_activity.
+#: Covers closing the browser context and page for this workflow.
+CLEANUP_TIMEOUT = timedelta(seconds=30)
+
+#: Time budget for a single attempt of scrape_top_comment_activity.
+#: Covers navigation to comment page + DOM parsing + application-level retries.
+SCRAPE_COMMENT_TIMEOUT = timedelta(seconds=30)
+
 #: Number of stories Hacker News renders per results page.
 #: This is a fixed property of the HN site, not a configurable parameter.
 HN_STORIES_PER_PAGE: int = 30
+
+#: Number of application-level retry attempts for comment scraping before failing.
+COMMENT_MAX_RETRIES: int = 3
+
+#: Initial backoff delay in seconds for comment scraping retries.
+COMMENT_RETRY_INITIAL_DELAY: float = 2.0
+
+#: Backoff multiplier for exponential backoff in comment scraping retries.
+COMMENT_RETRY_BACKOFF: float = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -100,14 +120,20 @@ class BrowserActivities:
     startup. Temporal calls activity methods on that instance, so all methods
     share browser state via `self`.
 
+    Browser isolation strategy:
+        - One shared `_browser` instance (lightweight, expensive to launch)
+        - Per-workflow `_contexts` and `_pages` keyed by `workflow_id`
+        - This ensures concurrent workflows never interfere with each other
+
     This class must never be instantiated more than once per worker process.
     """
 
     def __init__(self) -> None:
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
-        self._context: Optional[BrowserContext] = None
-        self._page: Optional[Page] = None
+        # Per-workflow isolation: each workflow gets its own context and page
+        self._contexts: dict[str, BrowserContext] = {}
+        self._pages: dict[str, Page] = {}
 
     # -------------------------------------------------------------------------
     # Public activities
@@ -115,15 +141,17 @@ class BrowserActivities:
 
     @activity.defn(name="start_playwright_activity")
     async def start_playwright_activity(self) -> bool:
-        """Launch Playwright and open a headless Chromium browser.
+        """Launch Playwright and create a workflow-specific browser context.
 
-        This is the explicit first activity in the scrape workflow. Subsequent
-        activities call `_ensure_browser()` internally, but calling this first
-        makes the browser initialisation step visible in the workflow history
-        and Temporal UI.
+        This is the explicit first activity in the scrape workflow. It creates
+        an isolated browser context for this workflow, ensuring concurrent
+        workflows never interfere with each other. Subsequent activities call
+        `_ensure_browser()` internally, but calling this first makes the
+        browser initialisation step visible in the workflow history and
+        Temporal UI.
 
         Returns:
-            True when the browser is ready.
+            True when the workflow's browser context is ready.
 
         Raises:
             ApplicationError(non_retryable=True): Playwright binary not found
@@ -143,7 +171,7 @@ class BrowserActivities:
         started_at = time.monotonic()
 
         try:
-            await self._ensure_browser(log=log)
+            await self._ensure_browser(workflow_id=info.workflow_id, log=log)
         except ApplicationError:
             # Non-retryable infra error — let it propagate as-is.
             raise
@@ -177,7 +205,7 @@ class BrowserActivities:
 
         `_ensure_browser()` is called at entry so the activity is resilient to
         worker restart between `start_playwright_activity` and this step — the
-        browser is transparently relaunched if state was lost.
+        browser context is transparently recreated if state was lost.
 
         Returns:
             True when the browser is positioned on a loaded HN front page.
@@ -198,11 +226,14 @@ class BrowserActivities:
             activity_id=info.activity_id,
         )
 
-        log.info("navigation.starting", status="starting", url=constants.HN_BASE_URL)
+        log.info("navigation.starting", status="starting",
+                 url=constants.HN_BASE_URL)
         started_at = time.monotonic()
 
         try:
-            await self._ensure_browser(log=log)
+            context, page = await self._ensure_browser(
+                workflow_id=info.workflow_id, log=log
+            )
         except ApplicationError:
             raise
         except BrowserStartError as exc:
@@ -216,10 +247,8 @@ class BrowserActivities:
             )
             raise
 
-        assert self._page is not None  # guaranteed by _ensure_browser
-
         try:
-            response = await self._page.goto(
+            response = await page.goto(
                 constants.HN_BASE_URL,
                 wait_until="domcontentloaded",
                 timeout=constants.BROWSER_TIMEOUT_MS,
@@ -227,7 +256,7 @@ class BrowserActivities:
         except PlaywrightError as exc:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             screenshot_path = await self._capture_screenshot(
-                info.activity_type, info.workflow_id
+                page, info.activity_type, info.workflow_id
             )
             log.error(
                 "navigation.failed",
@@ -235,7 +264,8 @@ class BrowserActivities:
                 reason="goto_error",
                 url=constants.HN_BASE_URL,
                 error=str(exc),
-                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                screenshot_path=str(
+                    screenshot_path) if screenshot_path else None,
                 duration_ms=duration_ms,
             )
             raise BrowserNavigationError(
@@ -247,7 +277,7 @@ class BrowserActivities:
         if response is not None and not response.ok:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             screenshot_path = await self._capture_screenshot(
-                info.activity_type, info.workflow_id
+                page, info.activity_type, info.workflow_id
             )
             log.error(
                 "navigation.failed",
@@ -255,7 +285,8 @@ class BrowserActivities:
                 reason="http_error",
                 url=constants.HN_BASE_URL,
                 http_status=response.status,
-                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                screenshot_path=str(
+                    screenshot_path) if screenshot_path else None,
                 duration_ms=duration_ms,
             )
             raise BrowserNavigationError(
@@ -264,18 +295,19 @@ class BrowserActivities:
 
         # Verify page identity: title must contain "Hacker News".
         try:
-            title = await self._page.title()
+            title = await page.title()
         except PlaywrightError as exc:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             screenshot_path = await self._capture_screenshot(
-                info.activity_type, info.workflow_id
+                page, info.activity_type, info.workflow_id
             )
             log.error(
                 "navigation.failed",
                 status="failed",
                 reason="title_read_error",
                 error=str(exc),
-                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                screenshot_path=str(
+                    screenshot_path) if screenshot_path else None,
                 duration_ms=duration_ms,
             )
             raise BrowserNavigationError(
@@ -285,7 +317,7 @@ class BrowserActivities:
         if "Hacker News" not in title:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             screenshot_path = await self._capture_screenshot(
-                info.activity_type, info.workflow_id
+                page, info.activity_type, info.workflow_id
             )
             log.error(
                 "navigation.failed",
@@ -293,7 +325,8 @@ class BrowserActivities:
                 reason="unexpected_page",
                 page_title=title,
                 url=constants.HN_BASE_URL,
-                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                screenshot_path=str(
+                    screenshot_path) if screenshot_path else None,
                 duration_ms=duration_ms,
             )
             raise BrowserNavigationError(
@@ -303,7 +336,7 @@ class BrowserActivities:
 
         # Verify at least one story row is present in the DOM.
         try:
-            await self._page.wait_for_selector(
+            await page.wait_for_selector(
                 ".athing",
                 state="attached",
                 timeout=constants.BROWSER_TIMEOUT_MS,
@@ -311,14 +344,15 @@ class BrowserActivities:
         except PlaywrightError as exc:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             screenshot_path = await self._capture_screenshot(
-                info.activity_type, info.workflow_id
+                page, info.activity_type, info.workflow_id
             )
             log.error(
                 "navigation.failed",
                 status="failed",
                 reason="no_stories_found",
                 error=str(exc),
-                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                screenshot_path=str(
+                    screenshot_path) if screenshot_path else None,
                 duration_ms=duration_ms,
             )
             raise BrowserNavigationError(
@@ -374,7 +408,7 @@ class BrowserActivities:
         started_at = time.monotonic()
 
         try:
-            await self._ensure_browser(log=log)
+            _, page = await self._ensure_browser(workflow_id=info.workflow_id, log=log)
         except ApplicationError:
             raise
         except BrowserStartError as exc:
@@ -388,23 +422,22 @@ class BrowserActivities:
             )
             raise
 
-        assert self._page is not None
-
         try:
-            stories = await self._extract_stories(top_n=top_n, log=log)
+            stories = await self._extract_stories(page=page, top_n=top_n, log=log)
         except ApplicationError:
             raise
         except (BrowserNavigationError, ParseError) as exc:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             screenshot_path = await self._capture_screenshot(
-                info.activity_type, info.workflow_id
+                page, info.activity_type, info.workflow_id
             )
             log.error(
                 "scrape.failed",
                 status="failed",
                 reason=type(exc).__name__,
                 error=str(exc),
-                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                screenshot_path=str(
+                    screenshot_path) if screenshot_path else None,
                 duration_ms=duration_ms,
             )
             if isinstance(exc, ParseError):
@@ -478,7 +511,7 @@ class BrowserActivities:
         started_at = time.monotonic()
 
         try:
-            await self._ensure_browser(log=log)
+            _, page = await self._ensure_browser(workflow_id=info.workflow_id, log=log)
         except ApplicationError:
             raise
         except BrowserStartError as exc:
@@ -493,19 +526,17 @@ class BrowserActivities:
             )
             raise
 
-        assert self._page is not None
-
         # Check whether the current page exposes a "More" link before
         # navigating away.  HN renders <a class="morelink"> at the bottom of
         # every page that has a successor.  Its absence means we've reached the
         # last available page — return False so the workflow stops pagination
         # without treating this as an error.
         try:
-            more_link = await self._page.query_selector("a.morelink")
+            more_link = await page.query_selector("a.morelink")
         except PlaywrightError as exc:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             screenshot_path = await self._capture_screenshot(
-                info.activity_type, info.workflow_id
+                page, info.activity_type, info.workflow_id
             )
             log.error(
                 "pagination.failed",
@@ -513,7 +544,8 @@ class BrowserActivities:
                 reason="morelink_query_error",
                 page_number=page_number,
                 error=str(exc),
-                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                screenshot_path=str(
+                    screenshot_path) if screenshot_path else None,
                 duration_ms=duration_ms,
             )
             raise BrowserNavigationError(
@@ -532,7 +564,7 @@ class BrowserActivities:
             return False
 
         try:
-            response = await self._page.goto(
+            response = await page.goto(
                 target_url,
                 wait_until="domcontentloaded",
                 timeout=constants.BROWSER_TIMEOUT_MS,
@@ -540,7 +572,7 @@ class BrowserActivities:
         except PlaywrightError as exc:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             screenshot_path = await self._capture_screenshot(
-                info.activity_type, info.workflow_id
+                page, info.activity_type, info.workflow_id
             )
             log.error(
                 "pagination.failed",
@@ -549,7 +581,8 @@ class BrowserActivities:
                 url=target_url,
                 page_number=page_number,
                 error=str(exc),
-                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                screenshot_path=str(
+                    screenshot_path) if screenshot_path else None,
                 duration_ms=duration_ms,
             )
             raise BrowserNavigationError(
@@ -559,7 +592,7 @@ class BrowserActivities:
         if response is not None and not response.ok:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             screenshot_path = await self._capture_screenshot(
-                info.activity_type, info.workflow_id
+                page, info.activity_type, info.workflow_id
             )
             log.error(
                 "pagination.failed",
@@ -568,7 +601,8 @@ class BrowserActivities:
                 url=target_url,
                 page_number=page_number,
                 http_status=response.status,
-                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                screenshot_path=str(
+                    screenshot_path) if screenshot_path else None,
                 duration_ms=duration_ms,
             )
             raise BrowserNavigationError(
@@ -577,11 +611,11 @@ class BrowserActivities:
             )
 
         try:
-            title = await self._page.title()
+            title = await page.title()
         except PlaywrightError as exc:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             screenshot_path = await self._capture_screenshot(
-                info.activity_type, info.workflow_id
+                page, info.activity_type, info.workflow_id
             )
             log.error(
                 "pagination.failed",
@@ -589,7 +623,8 @@ class BrowserActivities:
                 reason="title_read_error",
                 page_number=page_number,
                 error=str(exc),
-                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                screenshot_path=str(
+                    screenshot_path) if screenshot_path else None,
                 duration_ms=duration_ms,
             )
             raise BrowserNavigationError(
@@ -600,7 +635,7 @@ class BrowserActivities:
         if "Hacker News" not in title:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             screenshot_path = await self._capture_screenshot(
-                info.activity_type, info.workflow_id
+                page, info.activity_type, info.workflow_id
             )
             log.error(
                 "pagination.failed",
@@ -609,7 +644,8 @@ class BrowserActivities:
                 page_title=title,
                 url=target_url,
                 page_number=page_number,
-                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                screenshot_path=str(
+                    screenshot_path) if screenshot_path else None,
                 duration_ms=duration_ms,
             )
             raise BrowserNavigationError(
@@ -619,7 +655,7 @@ class BrowserActivities:
             )
 
         try:
-            await self._page.wait_for_selector(
+            await page.wait_for_selector(
                 ".athing",
                 state="attached",
                 timeout=constants.BROWSER_TIMEOUT_MS,
@@ -627,7 +663,7 @@ class BrowserActivities:
         except PlaywrightError as exc:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             screenshot_path = await self._capture_screenshot(
-                info.activity_type, info.workflow_id
+                page, info.activity_type, info.workflow_id
             )
             log.error(
                 "pagination.failed",
@@ -636,7 +672,8 @@ class BrowserActivities:
                 url=target_url,
                 page_number=page_number,
                 error=str(exc),
-                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                screenshot_path=str(
+                    screenshot_path) if screenshot_path else None,
                 duration_ms=duration_ms,
             )
             raise BrowserNavigationError(
@@ -655,12 +692,297 @@ class BrowserActivities:
         )
         return True
 
+    @activity.defn(name="scrape_top_comment_activity")
+    async def scrape_top_comment_activity(self, hn_id: str) -> Optional[str]:
+        """Scrape the top (first displayed) comment from a given HN story's page.
+
+        Creates a new browser page for isolation, navigates to the story's
+        comment page, extracts the first comment, and truncates to the
+        configured character limit. Implements application-level retries for
+        transient failures (network timeouts, temporary browser issues).
+
+        If the story has no comments, returns None (not an error). If the story
+        is deleted or not found, raises a non-retryable error.
+
+        Args:
+            hn_id: Hacker News item ID (e.g., "12345678").
+
+        Returns:
+            Top comment text (truncated to TOP_COMMENT_MAX_CHARS), or None if
+            the story has no comments or if scraping fails after retries.
+
+        Raises:
+            ApplicationError(non_retryable=True): Story not found (404), parse
+                error (DOM structure changed), or Playwright binary missing.
+            BrowserStartError: Browser could not be launched (retryable).
+            BrowserNavigationError: Navigation failed after all application
+                retries (retryable via Temporal retry policy).
+        """
+        info = activity.info()
+        log = structlog.get_logger().bind(
+            service=constants.SERVICE_NAME,
+            activity_name=info.activity_type,
+            workflow_id=info.workflow_id,
+            run_id=info.workflow_run_id,
+            activity_id=info.activity_id,
+            hn_id=hn_id,
+        )
+
+        log.info(
+            "comment_scrape.starting",
+            status="starting",
+            url=f"{constants.HN_BASE_URL}/item?id={hn_id}",
+        )
+        started_at = time.monotonic()
+
+        # Ensure browser context exists for this workflow
+        try:
+            context, _ = await self._ensure_browser(
+                workflow_id=info.workflow_id, log=log
+            )
+        except ApplicationError:
+            raise
+        except BrowserStartError as exc:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            log.error(
+                "comment_scrape.failed",
+                status="failed",
+                reason="browser_unavailable",
+                error=str(exc),
+                duration_ms=duration_ms,
+            )
+            raise
+
+        # Create dedicated page for this story to avoid state leakage
+        page = await context.new_page()
+        page.set_default_timeout(constants.BROWSER_TIMEOUT_MS)
+
+        try:
+            # Application-level retry loop for transient failures
+            last_exception: Optional[Exception] = None
+            for attempt in range(1, COMMENT_MAX_RETRIES + 1):
+                try:
+                    log.info(
+                        "comment_scrape.attempt",
+                        attempt=attempt,
+                        max_attempts=COMMENT_MAX_RETRIES,
+                    )
+
+                    # Navigate to comment page
+                    target_url = f"{constants.HN_BASE_URL}/item?id={hn_id}"
+                    response = await page.goto(
+                        target_url,
+                        wait_until="domcontentloaded",
+                        timeout=constants.BROWSER_TIMEOUT_MS,
+                    )
+
+                    # Check for 404 (story deleted/not found)
+                    if response and response.status == 404:
+                        duration_ms = int(
+                            (time.monotonic() - started_at) * 1000)
+                        log.error(
+                            "comment_scrape.failed",
+                            status="failed",
+                            reason="story_not_found",
+                            http_status=404,
+                            duration_ms=duration_ms,
+                        )
+                        raise ApplicationError(
+                            f"Story {hn_id} not found (HTTP 404)",
+                            non_retryable=True,
+                        )
+
+                    # Check for unexpected HTTP errors
+                    if response and not response.ok:
+                        error_msg = f"HTTP {response.status} from {target_url}"
+                        log.warning(
+                            "comment_scrape.http_error",
+                            attempt=attempt,
+                            http_status=response.status,
+                            error=error_msg,
+                        )
+                        # Treat as retryable (might be temporary server issue)
+                        raise BrowserNavigationError(error_msg)
+
+                    # Verify page loaded correctly
+                    try:
+                        title = await page.title()
+                        if "Hacker News" not in title:
+                            error_msg = (
+                                f"Unexpected page title '{title}' for story {hn_id}"
+                            )
+                            log.warning(
+                                "comment_scrape.unexpected_page",
+                                attempt=attempt,
+                                page_title=title,
+                            )
+                            raise BrowserNavigationError(error_msg)
+                    except PlaywrightError as exc:
+                        log.warning(
+                            "comment_scrape.title_read_error",
+                            attempt=attempt,
+                            error=str(exc),
+                        )
+                        raise BrowserNavigationError(
+                            f"Could not read page title for story {hn_id}: {exc}"
+                        ) from exc
+
+                    # Extract top comment
+                    comment_text = await self._extract_top_comment(
+                        page=page, hn_id=hn_id, log=log
+                    )
+
+                    # Success! Truncate if needed and return
+                    if comment_text is None:
+                        duration_ms = int(
+                            (time.monotonic() - started_at) * 1000)
+                        log.info(
+                            "comment_scrape.completed",
+                            status="completed",
+                            result="no_comments",
+                            duration_ms=duration_ms,
+                        )
+                        return None
+
+                    original_length = len(comment_text)
+                    if original_length > constants.TOP_COMMENT_MAX_CHARS:
+                        comment_text = comment_text[: constants.TOP_COMMENT_MAX_CHARS]
+                        truncated = True
+                    else:
+                        truncated = False
+
+                    duration_ms = int((time.monotonic() - started_at) * 1000)
+                    log.info(
+                        "comment_scrape.completed",
+                        status="completed",
+                        comment_length=len(comment_text),
+                        original_length=original_length,
+                        truncated=truncated,
+                        duration_ms=duration_ms,
+                    )
+                    return comment_text
+
+                except ApplicationError:
+                    # Non-retryable error (404, parse error) — fail immediately
+                    raise
+                except (BrowserNavigationError, PlaywrightError) as exc:
+                    last_exception = exc
+                    if attempt == COMMENT_MAX_RETRIES:
+                        # Exhausted retries — fail activity (Temporal will retry)
+                        duration_ms = int(
+                            (time.monotonic() - started_at) * 1000)
+                        screenshot_path = await self._capture_screenshot(
+                            info.activity_type, info.workflow_id
+                        )
+                        log.error(
+                            "comment_scrape.failed",
+                            status="failed",
+                            reason="retries_exhausted",
+                            attempts=COMMENT_MAX_RETRIES,
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                            screenshot_path=str(screenshot_path)
+                            if screenshot_path
+                            else None,
+                            duration_ms=duration_ms,
+                        )
+                        # Return None instead of raising to implement continue-on-error
+                        # The workflow will log this and continue with other stories
+                        return None
+
+                    # Retry with exponential backoff
+                    backoff_seconds = COMMENT_RETRY_INITIAL_DELAY * (
+                        COMMENT_RETRY_BACKOFF ** (attempt - 1)
+                    )
+                    log.warning(
+                        "comment_scrape.retry",
+                        status="retrying",
+                        attempt=attempt,
+                        max_attempts=COMMENT_MAX_RETRIES,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                        backoff_seconds=backoff_seconds,
+                    )
+                    await asyncio.sleep(backoff_seconds)
+                    continue
+
+            # Should never reach here (loop always returns or raises)
+            # But if it does, fail gracefully
+            if last_exception:
+                raise BrowserNavigationError(
+                    f"Comment scraping failed after {COMMENT_MAX_RETRIES} attempts: "
+                    f"{last_exception}"
+                ) from last_exception
+            return None
+
+        finally:
+            # Always close the page to prevent memory leaks
+            try:
+                await page.close()
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "comment_scrape.page_close_error",
+                    error=str(exc),
+                )
+
+    @activity.defn(name="cleanup_browser_context_activity")
+    async def cleanup_browser_context_activity(self) -> bool:
+        """Clean up this workflow's browser context and page.
+
+        Final activity in the scrape workflow. Called in the workflow's finally
+        block to ensure the context is always cleaned up, even if the workflow
+        fails. This prevents memory leaks from accumulating contexts.
+
+        Idempotent: safe to call multiple times. If the context doesn't exist
+        (already cleaned or never created), this is a no-op.
+
+        Returns:
+            True when cleanup succeeds (context closed) or is a no-op
+            (context already gone).
+
+        Raises:
+            BrowserStartError: Context or page close failed (retryable).
+                Temporal will retry cleanup to ensure resources are released.
+        """
+        info = activity.info()
+        log = structlog.get_logger().bind(
+            service=constants.SERVICE_NAME,
+            activity_name=info.activity_type,
+            workflow_id=info.workflow_id,
+            run_id=info.workflow_run_id,
+            activity_id=info.activity_id,
+        )
+
+        log.info("cleanup.starting", status="starting")
+        started_at = time.monotonic()
+
+        try:
+            await self._cleanup_workflow_context(workflow_id=info.workflow_id, log=log)
+        except BrowserStartError as exc:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            log.error(
+                "cleanup.failed",
+                status="failed",
+                error=str(exc),
+                duration_ms=duration_ms,
+            )
+            raise
+
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        log.info(
+            "cleanup.completed",
+            status="completed",
+            duration_ms=duration_ms,
+        )
+        return True
+
     # -------------------------------------------------------------------------
     # Internal helpers
     # -------------------------------------------------------------------------
 
     async def _extract_stories(
         self,
+        page: Page,
         top_n: int,
         log: Optional[structlog.types.FilteringBoundLogger] = None,
     ) -> list[Story]:
@@ -671,6 +993,7 @@ class BrowserActivities:
         warning; if no stories are extracted at all, ParseError is raised.
 
         Args:
+            page: Playwright Page object for this workflow.
             top_n: Maximum number of stories to extract.
             log: Bound structlog logger. A fresh unbound logger is used if None.
 
@@ -683,15 +1006,14 @@ class BrowserActivities:
         """
         if log is None:
             log = structlog.get_logger()
-        assert self._page is not None
 
         try:
-            await self._page.wait_for_selector(
+            await page.wait_for_selector(
                 ".athing",
                 state="attached",
                 timeout=constants.BROWSER_TIMEOUT_MS,
             )
-            rows = await self._page.query_selector_all("tr.athing")
+            rows = await page.query_selector_all("tr.athing")
         except PlaywrightError as exc:
             raise BrowserNavigationError(
                 f"Failed to locate story rows on HN page: {exc}"
@@ -700,7 +1022,7 @@ class BrowserActivities:
         stories: list[Story] = []
         for rank, row in enumerate(rows[:top_n], start=1):
             try:
-                story = await self._parse_story_row(row, fallback_rank=rank)
+                story = await self._parse_story_row(page, row, fallback_rank=rank)
                 stories.append(story)
             except ParseError as exc:
                 log.warning("scrape.story_skipped", rank=rank, reason=str(exc))
@@ -718,6 +1040,7 @@ class BrowserActivities:
 
     async def _parse_story_row(
         self,
+        page: Page,
         row: ElementHandle,
         fallback_rank: int,
     ) -> Story:
@@ -728,6 +1051,7 @@ class BrowserActivities:
         hn_id and title raise ParseError when absent; optional fields default.
 
         Args:
+            page: Playwright Page object for this workflow.
             row: ElementHandle for the tr.athing story row.
             fallback_rank: 1-indexed page position, used if span.rank is absent.
 
@@ -757,9 +1081,10 @@ class BrowserActivities:
             raise ParseError(f"Story {hn_id} has an empty title string.")
 
         href = (await title_el.get_attribute("href")) or ""
-        url: Optional[str] = None if href.startswith("item?id=") else href or None
+        url: Optional[str] = None if href.startswith(
+            "item?id=") else href or None
 
-        points, author, comments_count = await self._parse_subtext(hn_id)
+        points, author, comments_count = await self._parse_subtext(page, hn_id)
 
         return Story(
             hn_id=hn_id,
@@ -771,7 +1096,7 @@ class BrowserActivities:
             comments_count=comments_count,
         )
 
-    async def _parse_subtext(self, hn_id: str) -> tuple[int, str, int]:
+    async def _parse_subtext(self, page: Page, hn_id: str) -> tuple[int, str, int]:
         """Extract points, author, and comments count from a story's subtext row.
 
         The subtext row is the <tr> immediately following tr.athing#{hn_id}.
@@ -779,15 +1104,14 @@ class BrowserActivities:
         points=0, author="", comments_count=0.
 
         Args:
+            page: Playwright Page object for this workflow.
             hn_id: The HN item ID used to locate the adjacent subtext row.
 
         Returns:
             Tuple of (points, author, comments_count).
         """
-        assert self._page is not None
-
         # Use attribute selector instead of ID selector to handle numeric IDs
-        subtext = await self._page.query_selector(
+        subtext = await page.query_selector(
             f"tr.athing[id='{hn_id}'] + tr td.subtext"
         )
         if subtext is None:
@@ -812,87 +1136,281 @@ class BrowserActivities:
 
         return points, author, comments_count
 
+    async def _extract_top_comment(
+        self,
+        page: Page,
+        hn_id: str,
+        log: Optional[structlog.types.FilteringBoundLogger] = None,
+    ) -> Optional[str]:
+        """Extract the top (first displayed) comment from the current HN item page.
+
+        Uses CSS selectors to locate the first comment element in the comment tree.
+        HN's comment structure:
+            .comment-tree
+                └─ .athing.comtr (first comment)
+                    └─ .commtext (comment text)
+
+        Args:
+            page: Playwright Page object positioned on an HN item page.
+            hn_id: The HN item ID (for logging purposes).
+            log: Bound structlog logger. If None, a fresh unbound logger is used.
+
+        Returns:
+            Comment text as a string, or None if no comments exist.
+
+        Raises:
+            ApplicationError(non_retryable=True): Parse error (DOM structure changed).
+            PlaywrightError: DOM query failed (retryable).
+        """
+        if log is None:
+            log = structlog.get_logger()
+
+        # Wait for comment tree to be attached (if it exists)
+        # Don't wait too long—if there are no comments, the element won't exist
+        try:
+            await page.wait_for_selector(
+                ".comment-tree",
+                state="attached",
+                timeout=5000,  # Short timeout—if no comments, fail fast
+            )
+        except PlaywrightError:
+            # Comment tree doesn't exist—story has no comments
+            log.debug(
+                "comment_scrape.no_comment_tree",
+                hn_id=hn_id,
+                reason="comment_tree_not_found",
+            )
+            return None
+
+        # Find the first comment element
+        # HN structure: .comment-tree contains .athing.comtr elements (each is a comment)
+        try:
+            first_comment = await page.query_selector(".comment-tree .athing.comtr")
+        except PlaywrightError as exc:
+            raise ApplicationError(
+                f"Failed to query comment elements for story {hn_id}: {exc}",
+                non_retryable=True,
+            ) from exc
+
+        if first_comment is None:
+            # Comment tree exists but has no comments (edge case)
+            log.debug(
+                "comment_scrape.no_comments",
+                hn_id=hn_id,
+                reason="comment_tree_empty",
+            )
+            return None
+
+        # Extract the comment text from .commtext
+        try:
+            comment_el = await first_comment.query_selector(".commtext")
+        except PlaywrightError as exc:
+            raise ApplicationError(
+                f"Failed to query .commtext for story {hn_id}: {exc}",
+                non_retryable=True,
+            ) from exc
+
+        if comment_el is None:
+            # Comment element exists but has no text element (structural change?)
+            raise ApplicationError(
+                f"Comment element missing .commtext for story {hn_id}. "
+                "HN DOM structure may have changed.",
+                non_retryable=True,
+            )
+
+        # Get the text content
+        try:
+            comment_text = await comment_el.inner_text()
+        except PlaywrightError as exc:
+            raise ApplicationError(
+                f"Failed to extract text from .commtext for story {hn_id}: {exc}",
+                non_retryable=True,
+            ) from exc
+
+        # Strip whitespace and return
+        comment_text = comment_text.strip()
+        if not comment_text:
+            # Empty comment (edge case—user submitted blank comment?)
+            log.debug(
+                "comment_scrape.empty_comment",
+                hn_id=hn_id,
+                reason="comment_text_empty",
+            )
+            return None
+
+        return comment_text
+
     async def _ensure_browser(
         self,
+        workflow_id: str,
         log: Optional[structlog.types.FilteringBoundLogger] = None,
-    ) -> None:
-        """Guarantee that a live, ready browser is available on self.
+    ) -> tuple[BrowserContext, Page]:
+        """Guarantee that a live, ready browser context is available for this workflow.
 
-        Fast path: browser is already connected → returns immediately.
-        Slow path: browser is missing or disconnected → launches a fresh one.
+        Fast path: workflow's context already exists → returns immediately.
+        Slow path: context missing or browser disconnected → launches/recreates.
 
         This is called by every activity that needs the browser. It is the
         mechanism that makes the activity chain resilient to worker restarts:
         if the worker process was killed between activities, `self._browser`
         will be None on the new process and this method relaunches cleanly.
 
+        Isolation: Each workflow_id gets its own BrowserContext and Page,
+        ensuring concurrent workflows never interfere with each other.
+
         Args:
+            workflow_id: Temporal workflow ID for context isolation.
             log: Bound structlog logger from the calling activity. If None
                  a fresh unbound logger is used (for direct calls in tests).
+
+        Returns:
+            Tuple of (BrowserContext, Page) isolated to this workflow.
 
         Raises:
             ApplicationError(non_retryable=True): Playwright binary not found.
             BrowserStartError: Any other launch failure.
         """
-        if self._browser is not None and self._browser.is_connected():
-            return  # fast path — browser is alive
-
         if log is None:
             log = structlog.get_logger()
 
-        log.info("browser.launching", headless=constants.BROWSER_HEADLESS)
+        # -----------------------------------------------------------------------
+        # Step 1: Ensure shared browser is running
+        # -----------------------------------------------------------------------
+        if self._browser is None or not self._browser.is_connected():
+            log.info("browser.launching", headless=constants.BROWSER_HEADLESS)
 
-        # Tear down any half-open state from a previous failed attempt.
-        await self._teardown_silently(log=log)
+            # Tear down any half-open state from a previous failed attempt.
+            await self._teardown_silently(log=log)
 
-        try:
-            self._playwright = await async_playwright().start()
-        except Exception as exc:
-            # Playwright's own ImportError / FileNotFoundError when the binary
-            # is missing surfaces as a generic Exception from async_playwright().
-            # Treat this as non-retryable infra misconfiguration.
-            if "executable" in str(exc).lower() or "not found" in str(exc).lower():
-                raise ApplicationError(
-                    f"Playwright binary not found — run 'playwright install chromium': {exc}",
-                    non_retryable=True,
+            try:
+                self._playwright = await async_playwright().start()
+            except Exception as exc:
+                # Playwright's own ImportError / FileNotFoundError when the binary
+                # is missing surfaces as a generic Exception from async_playwright().
+                # Treat this as non-retryable infra misconfiguration.
+                if "executable" in str(exc).lower() or "not found" in str(exc).lower():
+                    raise ApplicationError(
+                        f"Playwright binary not found — run 'playwright install chromium': {exc}",
+                        non_retryable=True,
+                    ) from exc
+                raise BrowserStartError(
+                    f"Failed to start Playwright runtime: {exc}"
                 ) from exc
-            raise BrowserStartError(
-                f"Failed to start Playwright runtime: {exc}"
-            ) from exc
 
-        try:
-            self._browser = await self._playwright.chromium.launch(
+            try:
+                self._browser = await self._playwright.chromium.launch(
+                    headless=constants.BROWSER_HEADLESS,
+                )
+            except PlaywrightError as exc:
+                raise BrowserStartError(
+                    f"Failed to launch Chromium: {exc}"
+                ) from exc
+
+            log.info(
+                "browser.launched",
                 headless=constants.BROWSER_HEADLESS,
             )
-        except PlaywrightError as exc:
-            raise BrowserStartError(
-                f"Failed to launch Chromium: {exc}"
-            ) from exc
 
+        # -----------------------------------------------------------------------
+        # Step 2: Get or create workflow-specific context
+        # -----------------------------------------------------------------------
+        if workflow_id in self._contexts:
+            log.debug(
+                "browser.context_reused",
+                workflow_id=workflow_id,
+                total_contexts=len(self._contexts),
+            )
+            return self._contexts[workflow_id], self._pages[workflow_id]
+
+        # Create new context for this workflow
         try:
-            self._context = await self._browser.new_context(
+            context = await self._browser.new_context(
                 viewport={
                     "width": constants.BROWSER_VIEWPORT_WIDTH,
                     "height": constants.BROWSER_VIEWPORT_HEIGHT,
                 },
             )
-            self._context.set_default_timeout(constants.BROWSER_TIMEOUT_MS)
+            context.set_default_timeout(constants.BROWSER_TIMEOUT_MS)
 
-            self._page = await self._context.new_page()
-            self._page.set_default_timeout(constants.BROWSER_TIMEOUT_MS)
+            page = await context.new_page()
+            page.set_default_timeout(constants.BROWSER_TIMEOUT_MS)
         except PlaywrightError as exc:
-            # Context/page creation failed — tear down the browser we just
-            # launched so we leave no orphaned processes.
-            await self._teardown_silently(log=log)
+            # Context/page creation failed — if this was the first workflow,
+            # tear down the browser we just launched.
+            if not self._contexts:
+                await self._teardown_silently(log=log)
             raise BrowserStartError(
-                f"Failed to create browser context or page: {exc}"
+                f"Failed to create browser context or page for workflow {workflow_id}: {exc}"
             ) from exc
 
+        self._contexts[workflow_id] = context
+        self._pages[workflow_id] = page
+
         log.info(
-            "browser.launched",
-            headless=constants.BROWSER_HEADLESS,
+            "browser.context_created",
+            workflow_id=workflow_id,
+            total_contexts=len(self._contexts),
             viewport_width=constants.BROWSER_VIEWPORT_WIDTH,
             viewport_height=constants.BROWSER_VIEWPORT_HEIGHT,
+        )
+
+        return context, page
+
+    async def _cleanup_workflow_context(
+        self,
+        workflow_id: str,
+        log: Optional[structlog.types.FilteringBoundLogger] = None,
+    ) -> None:
+        """Close and remove a specific workflow's browser context.
+
+        Called by cleanup_browser_context_activity when a workflow completes.
+        Raises exceptions so cleanup failures can be retried.
+
+        Args:
+            workflow_id: Temporal workflow ID whose context should be cleaned up.
+            log: Bound structlog logger. If None, a fresh unbound logger is used.
+
+        Raises:
+            BrowserStartError: Context or page close failed (retryable).
+        """
+        if log is None:
+            log = structlog.get_logger()
+
+        # Idempotent: if context doesn't exist, cleanup already happened
+        if workflow_id not in self._contexts:
+            log.debug(
+                "browser.context_already_cleaned",
+                workflow_id=workflow_id,
+            )
+            return
+
+        # Close page first, then context
+        try:
+            page = self._pages.get(workflow_id)
+            if page:
+                await page.close()
+        except PlaywrightError as exc:
+            raise BrowserStartError(
+                f"Failed to close page for workflow {workflow_id}: {exc}"
+            ) from exc
+
+        try:
+            context = self._contexts.get(workflow_id)
+            if context:
+                await context.close()
+        except PlaywrightError as exc:
+            raise BrowserStartError(
+                f"Failed to close context for workflow {workflow_id}: {exc}"
+            ) from exc
+
+        # Remove from dictionaries
+        self._pages.pop(workflow_id, None)
+        self._contexts.pop(workflow_id, None)
+
+        log.info(
+            "browser.context_cleaned",
+            workflow_id=workflow_id,
+            remaining_contexts=len(self._contexts),
         )
 
     async def _teardown_silently(
@@ -901,18 +1419,49 @@ class BrowserActivities:
     ) -> None:
         """Close all browser resources, swallowing errors.
 
-        Called during error recovery and by stop_playwright_activity. Errors
-        are logged but not raised — a failed teardown must not mask the
-        original error.
+        Called during error recovery and worker shutdown. Closes all
+        workflow contexts, the shared browser, and Playwright runtime.
+        Errors are logged but not raised — a failed teardown must not
+        mask the original error.
         """
         if log is None:
             log = structlog.get_logger()
 
+        # Close all workflow-specific pages and contexts
+        for workflow_id in list(self._pages.keys()):
+            try:
+                page = self._pages.get(workflow_id)
+                if page:
+                    await page.close()
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "browser.teardown_error",
+                    resource="page",
+                    workflow_id=workflow_id,
+                    error=str(exc),
+                )
+
+        for workflow_id in list(self._contexts.keys()):
+            try:
+                context = self._contexts.get(workflow_id)
+                if context:
+                    await context.close()
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "browser.teardown_error",
+                    resource="context",
+                    workflow_id=workflow_id,
+                    error=str(exc),
+                )
+
+        self._pages.clear()
+        self._contexts.clear()
+
+        # Close shared browser and playwright
         for resource_name, close_coro_factory in (
-            ("page", lambda: self._page.close() if self._page else None),
-            ("context", lambda: self._context.close() if self._context else None),
             ("browser", lambda: self._browser.close() if self._browser else None),
-            ("playwright", lambda: self._playwright.stop() if self._playwright else None),
+            ("playwright", lambda: self._playwright.stop()
+             if self._playwright else None),
         ):
             coro = close_coro_factory()
             if coro is not None:
@@ -925,26 +1474,34 @@ class BrowserActivities:
                         error=str(exc),
                     )
 
-        self._page = None
-        self._context = None
         self._browser = None
         self._playwright = None
 
-    async def _capture_screenshot(self, activity_name: str, workflow_id: str) -> Optional[Path]:
+    async def _capture_screenshot(
+        self,
+        page: Page,
+        activity_name: str,
+        workflow_id: str,
+    ) -> Optional[Path]:
         """Save a failure screenshot and return its path, or None on failure.
 
         Best-effort: errors are swallowed so that screenshot capture never
         masks the original exception.
-        """
-        if self._page is None:
-            return None
 
+        Args:
+            page: Playwright Page object for this workflow.
+            activity_name: Name of the activity that failed.
+            workflow_id: Temporal workflow ID.
+
+        Returns:
+            Path to screenshot file, or None if capture failed.
+        """
         screenshot_path = (
             Path(constants.BROWSER_SCREENSHOT_DIR)
             / f"hn_scraper_{activity_name}_{workflow_id}_{int(time.time())}.png"
         )
         try:
-            await self._page.screenshot(path=str(screenshot_path))
+            await page.screenshot(path=str(screenshot_path))
             return screenshot_path
         except Exception:  # noqa: BLE001
             return None

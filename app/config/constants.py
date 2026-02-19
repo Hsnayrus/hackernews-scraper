@@ -67,6 +67,14 @@ LOG_LEVEL: str = os.environ["LOG_LEVEL"]
 HN_BASE_URL: str = os.environ["HN_BASE_URL"]
 SCRAPE_TOP_N: int = int(os.environ["SCRAPE_TOP_N"])
 
+# Maximum characters to store for a story's top comment. Comments longer than
+# this will be truncated. Optional — defaults to 10000 characters (~1500 words).
+TOP_COMMENT_MAX_CHARS: int = int(os.environ.get("TOP_COMMENT_MAX_CHARS", "10000"))
+
+# Milliseconds to wait between scraping comments for different stories.
+# Helps avoid HN rate limiting. Optional — defaults to 100ms.
+COMMENT_SCRAPE_DELAY_MS: int = int(os.environ.get("COMMENT_SCRAPE_DELAY_MS", "100"))
+
 # ---------------------------------------------------------------------------
 # Browser (Playwright)
 #

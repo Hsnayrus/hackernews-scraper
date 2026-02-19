@@ -87,6 +87,8 @@ async def main() -> None:
             browser_activities.navigate_to_hacker_news_activity,
             browser_activities.scrape_urls_activity,
             browser_activities.navigate_to_next_page_activity,
+            browser_activities.scrape_top_comment_activity,
+            browser_activities.cleanup_browser_context_activity,
             # Database persistence activities
             persistence_activities.create_scrape_run_activity,
             persistence_activities.upsert_stories_activity,
@@ -95,7 +97,14 @@ async def main() -> None:
     )
 
     log.info("worker.polling")
-    await worker.run()
+
+    try:
+        await worker.run()
+    finally:
+        # Worker shutting down — clean up all remaining browser contexts
+        log.info("worker.shutting_down", message="Cleaning up browser resources")
+        await browser_activities._teardown_silently(log=log)
+        log.info("worker.shutdown_complete")
 
 
 if __name__ == "__main__":
