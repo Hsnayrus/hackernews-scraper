@@ -118,6 +118,7 @@ async def list_stories(
             points=s.points,
             author=s.author,
             comments_count=s.comments_count,
+            top_comment=s.top_comment,
             scraped_at=s.scraped_at,
             created_at=s.created_at,
         )

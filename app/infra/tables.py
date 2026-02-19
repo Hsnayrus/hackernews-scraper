@@ -42,6 +42,7 @@ stories_table: sa.Table = sa.Table(
     sa.Column("points", sa.INTEGER, nullable=False),
     sa.Column("author", sa.VARCHAR(255), nullable=False),
     sa.Column("comments_count", sa.INTEGER, nullable=False),
+    sa.Column("top_comment", sa.TEXT, nullable=True),
     sa.Column(
         "scraped_at",
         sa.TIMESTAMP(timezone=True),

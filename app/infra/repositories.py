@@ -46,6 +46,7 @@ def _row_to_story(row: sa.engine.Row) -> Story:  # type: ignore[type-arg]
         points=row.points,
         author=row.author,
         comments_count=row.comments_count,
+        top_comment=row.top_comment,
         scraped_at=row.scraped_at,
         created_at=row.created_at,
     )
@@ -103,6 +104,7 @@ class StoryRepository:
                 "points": story.points,
                 "author": story.author,
                 "comments_count": story.comments_count,
+                "top_comment": story.top_comment,
                 "scraped_at": story.scraped_at,
                 "created_at": story.created_at,
             }
@@ -119,6 +121,7 @@ class StoryRepository:
                 "points": stmt.excluded.points,
                 "author": stmt.excluded.author,
                 "comments_count": stmt.excluded.comments_count,
+                "top_comment": stmt.excluded.top_comment,
                 "scraped_at": stmt.excluded.scraped_at,
                 # created_at is intentionally excluded: preserves first-seen time.
                 # id is intentionally excluded: preserves original UUID.

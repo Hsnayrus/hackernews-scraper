@@ -7,8 +7,9 @@ orchestrates the end-to-end scraping process:
     2. Launch browser
     3. Navigate to Hacker News
     4. Scrape top N stories
-    5. Persist stories to database
-    6. Update scrape run status
+    5. Scrape top comment for each story
+    6. Persist stories (with comments) to database
+    7. Update scrape run status
 
 The workflow is deterministic — all side effects (browser, database, logging)
 are implemented as activities. The workflow only orchestrates.
@@ -27,11 +28,14 @@ with workflow.unsafe.imports_passed_through():
     from app.activities.browser import (
         BROWSER_RETRY_POLICY,
         BROWSER_START_TIMEOUT,
+        CLEANUP_TIMEOUT,
         HN_STORIES_PER_PAGE,
         NAVIGATE_TIMEOUT,
         NAVIGATE_TO_NEXT_PAGE_TIMEOUT,
+        SCRAPE_COMMENT_TIMEOUT,
         SCRAPE_TIMEOUT,
     )
+    from app.config import constants
     from app.domain.exceptions import ParseError
     from app.domain.models import ScrapeRun, ScrapeRunStatus, Story
 
@@ -108,6 +112,46 @@ class ScrapeHackerNewsWorkflow:
         all_stories: list[Story] = []
 
         try:
+            # Wrap entire workflow in try/finally to ensure browser cleanup
+            return await self._execute_scrape(
+                wf_id, logger, top_n, run_id, scrape_run, all_stories
+            )
+        finally:
+            # Always clean up browser context, even if workflow fails.
+            # This prevents memory leaks from accumulating browser contexts.
+            logger.info(f"Cleaning up browser context: workflow_id={wf_id}")
+            try:
+                await workflow.execute_activity_method(
+                    "cleanup_browser_context_activity",
+                    start_to_close_timeout=CLEANUP_TIMEOUT,
+                    retry_policy=BROWSER_RETRY_POLICY,
+                )
+                logger.info(f"Browser context cleaned up: workflow_id={wf_id}")
+            except Exception as cleanup_exc:  # noqa: BLE001
+                # Best effort — log cleanup failure but don't mask the
+                # original workflow error (if any).
+                logger.error(
+                    f"Failed to clean up browser context: workflow_id={wf_id}, "
+                    f"error={str(cleanup_exc)}"
+                )
+
+    async def _execute_scrape(
+        self,
+        wf_id: str,
+        logger,
+        top_n: int,
+        run_id: Optional[UUID],
+        scrape_run: Optional[ScrapeRun],
+        all_stories: list[Story],
+    ) -> ScrapeRun:
+        """Internal method containing the main scrape workflow logic.
+
+        Extracted to allow try/finally cleanup in the main run method.
+        """
+        # Initialize here so it's available in the except block for salvaging
+        stories_with_comments: list[Story] = []
+
+        try:
             # ---------------------------------------------------------------
             # Step 1: Create scrape run record
             # ---------------------------------------------------------------
@@ -169,12 +213,15 @@ class ScrapeHackerNewsWorkflow:
             )
 
             # Page 1 is already loaded by navigate_to_hacker_news_activity.
-            page_1_stories: list[Story] = await workflow.execute_activity_method(
+            raw_page_1_stories = await workflow.execute_activity_method(
                 "scrape_urls_activity",
                 args=[top_n],
                 start_to_close_timeout=SCRAPE_TIMEOUT,
                 retry_policy=BROWSER_RETRY_POLICY,
             )
+            page_1_stories: list[Story] = [
+                Story(**s) if isinstance(s, dict) else s for s in raw_page_1_stories
+            ]
             all_stories.extend(page_1_stories)
             logger.info(
                 f"Page 1 scraped: workflow_id={wf_id}, "
@@ -203,12 +250,15 @@ class ScrapeHackerNewsWorkflow:
                     )
                     break
 
-                page_stories: list[Story] = await workflow.execute_activity_method(
+                raw_page_stories = await workflow.execute_activity_method(
                     "scrape_urls_activity",
                     args=[top_n],
                     start_to_close_timeout=SCRAPE_TIMEOUT,
                     retry_policy=BROWSER_RETRY_POLICY,
                 )
+                page_stories: list[Story] = [
+                    Story(**s) if isinstance(s, dict) else s for s in raw_page_stories
+                ]
 
                 if not page_stories:
                     logger.info(
@@ -232,14 +282,80 @@ class ScrapeHackerNewsWorkflow:
             )
 
             # ---------------------------------------------------------------
-            # Step 5: Persist stories to database
+            # Step 5: Scrape top comment for each story
+            # ---------------------------------------------------------------
+            logger.info(
+                f"Scraping comments: workflow_id={wf_id}, stories_count={stories_count}"
+            )
+
+            comments_scraped = 0
+            comments_failed = 0
+
+            for idx, story in enumerate(stories, start=1):
+                logger.info(
+                    f"Scraping comment for story {idx}/{stories_count}: "
+                    f"workflow_id={wf_id}, hn_id={story.hn_id}"
+                )
+
+                try:
+                    top_comment: Optional[str] = await workflow.execute_activity_method(
+                        "scrape_top_comment_activity",
+                        args=[story.hn_id],
+                        start_to_close_timeout=SCRAPE_COMMENT_TIMEOUT,
+                        retry_policy=BROWSER_RETRY_POLICY,
+                    )
+
+                    # Enrich story with top comment
+                    enriched_story = story.model_copy(
+                        update={"top_comment": top_comment}
+                    )
+                    stories_with_comments.append(enriched_story)
+
+                    if top_comment:
+                        comments_scraped += 1
+                        logger.info(
+                            f"Comment scraped: workflow_id={wf_id}, hn_id={story.hn_id}, "
+                            f"comment_length={len(top_comment)}"
+                        )
+                    else:
+                        logger.info(
+                            f"No comment found: workflow_id={wf_id}, hn_id={story.hn_id}"
+                        )
+
+                except Exception as exc:  # noqa: BLE001
+                    # Continue on error: log failure, store story with NULL comment
+                    comments_failed += 1
+                    logger.error(
+                        f"Comment scraping failed: workflow_id={wf_id}, "
+                        f"hn_id={story.hn_id}, error_type={type(exc).__name__}, "
+                        f"error={str(exc)}"
+                    )
+                    # Store story with NULL comment
+                    enriched_story = story.model_copy(update={"top_comment": None})
+                    stories_with_comments.append(enriched_story)
+
+                # Rate limiting: add delay between comment scrapes
+                # (except after the last story—no need to wait)
+                if idx < stories_count:
+                    delay_seconds = constants.COMMENT_SCRAPE_DELAY_MS / 1000.0
+                    await workflow.sleep(delay_seconds)
+
+            logger.info(
+                f"Comments scraping completed: workflow_id={wf_id}, "
+                f"total={stories_count}, scraped={comments_scraped}, "
+                f"no_comments={stories_count - comments_scraped - comments_failed}, "
+                f"failed={comments_failed}"
+            )
+
+            # ---------------------------------------------------------------
+            # Step 6: Persist stories to database
             # ---------------------------------------------------------------
             logger.info(
                 f"Persisting stories: workflow_id={wf_id}, stories_count={stories_count}")
 
             upserted_count: int = await workflow.execute_activity_method(
                 "upsert_stories_activity",
-                args=[stories],
+                args=[stories_with_comments],  # Now includes top_comment
                 start_to_close_timeout=DB_ACTIVITY_TIMEOUT,
                 retry_policy=DB_RETRY_POLICY,
             )
@@ -248,7 +364,7 @@ class ScrapeHackerNewsWorkflow:
                 f"Stories persisted: workflow_id={wf_id}, upserted_count={upserted_count}")
 
             # ---------------------------------------------------------------
-            # Step 6: Update scrape run status to COMPLETED
+            # Step 7: Update scrape run status to COMPLETED
             # ---------------------------------------------------------------
             logger.info(
                 f"Updating scrape run to COMPLETED: workflow_id={wf_id}")
@@ -288,12 +404,26 @@ class ScrapeHackerNewsWorkflow:
                 # Best-effort: persist any stories scraped before the failure
                 # so partial results are not lost.
                 salvaged_count: Optional[int] = None
-                if all_stories:
+
+                # Prefer stories_with_comments if populated (failure during/after
+                # comment scraping), otherwise fall back to all_stories (failure
+                # during story scraping, before comment scraping began).
+                if stories_with_comments:
+                    stories_to_salvage = stories_with_comments
+                    logger.info(
+                        f"Salvaging {len(stories_to_salvage)} stories with comments "
+                        f"before marking run as FAILED: workflow_id={wf_id}"
+                    )
+                elif all_stories:
                     stories_to_salvage = all_stories[:top_n]
                     logger.info(
-                        f"Salvaging {len(stories_to_salvage)} stories before marking "
-                        f"run as FAILED: workflow_id={wf_id}"
+                        f"Salvaging {len(stories_to_salvage)} stories (no comments) "
+                        f"before marking run as FAILED: workflow_id={wf_id}"
                     )
+                else:
+                    stories_to_salvage = []
+
+                if stories_to_salvage:
                     try:
                         salvaged_count = await workflow.execute_activity_method(
                             "upsert_stories_activity",

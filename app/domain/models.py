@@ -95,6 +95,14 @@ class Story(BaseModel):
     comments_count: int = Field(
         ge=0, description="Number of comments at time of scrape."
     )
+    top_comment: Optional[str] = Field(
+        default=None,
+        description=(
+            "The top (first displayed) comment from this story's HN page. "
+            "None if the story has no comments or if comment scraping failed. "
+            "Truncated to TOP_COMMENT_MAX_CHARS if the original exceeds the limit."
+        ),
+    )
     scraped_at: datetime = Field(
         default_factory=_utcnow,
         description="UTC timestamp when this story was scraped.",
