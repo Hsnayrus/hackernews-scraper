@@ -686,10 +686,15 @@ class BrowserActivities:
     async def scrape_top_comment_activity(self, hn_id: str) -> Optional[str]:
         """Scrape the top (first displayed) comment from a given HN story's page.
 
-        Creates a new browser page for isolation, navigates to the story's
-        comment page, extracts the first comment, and truncates to the
-        configured character limit. Transient failures are retried by Temporal
-        via the BROWSER_RETRY_POLICY configured at the workflow call site.
+        Navigates the workflow's shared page to the story's comment page,
+        extracts the first comment, and truncates to the configured character
+        limit. Transient failures are retried by Temporal via the
+        BROWSER_RETRY_POLICY configured at the workflow call site.
+
+        Context-level isolation (one BrowserContext per workflow_id) is
+        sufficient — no per-story page creation is needed because comment
+        scraping runs sequentially after all front-page scraping is complete
+        and the shared page is idle.
 
         If the story has no comments, returns None (not an error). If the story
         is deleted or not found, raises a non-retryable error.
@@ -725,9 +730,9 @@ class BrowserActivities:
         )
         started_at = time.monotonic()
 
-        # Ensure browser context exists for this workflow
+        # Use the workflow's shared page — context-level isolation is sufficient.
         try:
-            context, _ = await self._ensure_browser(
+            _, page = await self._ensure_browser(
                 workflow_id=info.workflow_id, log=log
             )
         except ApplicationError:
@@ -743,142 +748,127 @@ class BrowserActivities:
             )
             raise
 
-        # Create dedicated page for this story to avoid state leakage
-        page = await context.new_page()
-        page.set_default_timeout(constants.BROWSER_TIMEOUT_MS)
-
+        # Navigate to comment page
+        target_url = f"{constants.HN_BASE_URL}/item?id={hn_id}"
         try:
-            # Navigate to comment page
-            target_url = f"{constants.HN_BASE_URL}/item?id={hn_id}"
-            try:
-                response = await page.goto(
-                    target_url,
-                    wait_until="domcontentloaded",
-                    timeout=constants.BROWSER_TIMEOUT_MS,
-                )
-            except PlaywrightError as exc:
+            response = await page.goto(
+                target_url,
+                wait_until="domcontentloaded",
+                timeout=constants.BROWSER_TIMEOUT_MS,
+            )
+        except PlaywrightError as exc:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            screenshot_path = await self._capture_screenshot(
+                page, info.activity_type, info.workflow_id
+            )
+            log.error(
+                "comment_scrape.failed",
+                status="failed",
+                reason="navigation_error",
+                error=str(exc),
+                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                duration_ms=duration_ms,
+            )
+            raise BrowserNavigationError(
+                f"Navigation failed for story {hn_id}: {exc}"
+            ) from exc
+
+        # Check for 404 (story deleted/not found)
+        if response and response.status == 404:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            log.error(
+                "comment_scrape.failed",
+                status="failed",
+                reason="story_not_found",
+                http_status=404,
+                duration_ms=duration_ms,
+            )
+            raise ApplicationError(
+                f"Story {hn_id} not found (HTTP 404)",
+                non_retryable=True,
+            )
+
+        # Check for unexpected HTTP errors
+        if response and not response.ok:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            screenshot_path = await self._capture_screenshot(
+                page, info.activity_type, info.workflow_id
+            )
+            error_msg = f"HTTP {response.status} from {target_url}"
+            log.error(
+                "comment_scrape.failed",
+                status="failed",
+                reason="http_error",
+                http_status=response.status,
+                error=error_msg,
+                screenshot_path=str(screenshot_path) if screenshot_path else None,
+                duration_ms=duration_ms,
+            )
+            raise BrowserNavigationError(error_msg)
+
+        # Verify page loaded correctly
+        try:
+            title = await page.title()
+            if "Hacker News" not in title:
                 duration_ms = int((time.monotonic() - started_at) * 1000)
                 screenshot_path = await self._capture_screenshot(
-                    info.activity_type, info.workflow_id
+                    page, info.activity_type, info.workflow_id
                 )
+                error_msg = f"Unexpected page title '{title}' for story {hn_id}"
                 log.error(
                     "comment_scrape.failed",
                     status="failed",
-                    reason="navigation_error",
-                    error=str(exc),
-                    screenshot_path=str(screenshot_path) if screenshot_path else None,
-                    duration_ms=duration_ms,
-                )
-                raise BrowserNavigationError(
-                    f"Navigation failed for story {hn_id}: {exc}"
-                ) from exc
-
-            # Check for 404 (story deleted/not found)
-            if response and response.status == 404:
-                duration_ms = int((time.monotonic() - started_at) * 1000)
-                log.error(
-                    "comment_scrape.failed",
-                    status="failed",
-                    reason="story_not_found",
-                    http_status=404,
-                    duration_ms=duration_ms,
-                )
-                raise ApplicationError(
-                    f"Story {hn_id} not found (HTTP 404)",
-                    non_retryable=True,
-                )
-
-            # Check for unexpected HTTP errors
-            if response and not response.ok:
-                duration_ms = int((time.monotonic() - started_at) * 1000)
-                screenshot_path = await self._capture_screenshot(
-                    info.activity_type, info.workflow_id
-                )
-                error_msg = f"HTTP {response.status} from {target_url}"
-                log.error(
-                    "comment_scrape.failed",
-                    status="failed",
-                    reason="http_error",
-                    http_status=response.status,
-                    error=error_msg,
+                    reason="unexpected_page",
+                    page_title=title,
                     screenshot_path=str(screenshot_path) if screenshot_path else None,
                     duration_ms=duration_ms,
                 )
                 raise BrowserNavigationError(error_msg)
-
-            # Verify page loaded correctly
-            try:
-                title = await page.title()
-                if "Hacker News" not in title:
-                    duration_ms = int((time.monotonic() - started_at) * 1000)
-                    screenshot_path = await self._capture_screenshot(
-                        info.activity_type, info.workflow_id
-                    )
-                    error_msg = f"Unexpected page title '{title}' for story {hn_id}"
-                    log.error(
-                        "comment_scrape.failed",
-                        status="failed",
-                        reason="unexpected_page",
-                        page_title=title,
-                        screenshot_path=str(screenshot_path) if screenshot_path else None,
-                        duration_ms=duration_ms,
-                    )
-                    raise BrowserNavigationError(error_msg)
-            except PlaywrightError as exc:
-                duration_ms = int((time.monotonic() - started_at) * 1000)
-                log.error(
-                    "comment_scrape.failed",
-                    status="failed",
-                    reason="title_read_error",
-                    error=str(exc),
-                    duration_ms=duration_ms,
-                )
-                raise BrowserNavigationError(
-                    f"Could not read page title for story {hn_id}: {exc}"
-                ) from exc
-
-            # Extract top comment
-            comment_text = await self._extract_top_comment(
-                page=page, hn_id=hn_id, log=log
+        except PlaywrightError as exc:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            log.error(
+                "comment_scrape.failed",
+                status="failed",
+                reason="title_read_error",
+                error=str(exc),
+                duration_ms=duration_ms,
             )
+            raise BrowserNavigationError(
+                f"Could not read page title for story {hn_id}: {exc}"
+            ) from exc
 
-            if comment_text is None:
-                duration_ms = int((time.monotonic() - started_at) * 1000)
-                log.info(
-                    "comment_scrape.completed",
-                    status="completed",
-                    result="no_comments",
-                    duration_ms=duration_ms,
-                )
-                return None
+        # Extract top comment
+        comment_text = await self._extract_top_comment(
+            page=page, hn_id=hn_id, log=log
+        )
 
-            original_length = len(comment_text)
-            if original_length > constants.TOP_COMMENT_MAX_CHARS:
-                comment_text = comment_text[: constants.TOP_COMMENT_MAX_CHARS]
-                truncated = True
-            else:
-                truncated = False
-
+        if comment_text is None:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             log.info(
                 "comment_scrape.completed",
                 status="completed",
-                comment_length=len(comment_text),
-                original_length=original_length,
-                truncated=truncated,
+                result="no_comments",
                 duration_ms=duration_ms,
             )
-            return comment_text
+            return None
 
-        finally:
-            # Always close the page to prevent memory leaks
-            try:
-                await page.close()
-            except Exception as exc:  # noqa: BLE001
-                log.warning(
-                    "comment_scrape.page_close_error",
-                    error=str(exc),
-                )
+        original_length = len(comment_text)
+        if original_length > constants.TOP_COMMENT_MAX_CHARS:
+            comment_text = comment_text[: constants.TOP_COMMENT_MAX_CHARS]
+            truncated = True
+        else:
+            truncated = False
+
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        log.info(
+            "comment_scrape.completed",
+            status="completed",
+            comment_length=len(comment_text),
+            original_length=original_length,
+            truncated=truncated,
+            duration_ms=duration_ms,
+        )
+        return comment_text
 
     @activity.defn(name="cleanup_browser_context_activity")
     async def cleanup_browser_context_activity(self) -> bool:

@@ -169,6 +169,7 @@ All modules import from app.config.constants
 - **Idempotent writes**: Stories are upserted by `hn_id` using `ON CONFLICT DO UPDATE`.
 - **Fail-fast config**: Missing environment variables raise `KeyError` at import time, not mid-request.
 - **Browser isolation**: Each scrape run gets a fresh Playwright browser context.
+- **Top comment enrichment**: After scraping front-page stories, the workflow visits each story's HN comments page and captures the top comment. Comment scraping failures are non-fatal — stories are persisted with `top_comment: null` rather than failing the workflow.
 
 ---
 
@@ -232,8 +233,9 @@ Response:
 2. Launches Playwright browser in headless mode
 3. Navigates to <https://news.ycombinator.com>
 4. Scrapes top 30 stories (configurable via `SCRAPE_TOP_N`)
-5. Upserts stories into `stories` table (idempotent by `hn_id`)
-6. Updates scrape run status to `COMPLETED` or `FAILED`
+5. For each story, navigates to its HN comments page and scrapes the top comment
+6. Upserts stories (with top comments) into `stories` table (idempotent by `hn_id`)
+7. Updates scrape run status to `COMPLETED` or `FAILED`
 
 ---
 
@@ -285,6 +287,7 @@ Response:
       "points": 420,
       "author": "pg",
       "comments_count": 137,
+      "top_comment": "This is the top comment text from the HN discussion thread.",
       "scraped_at": "2026-02-15T10:30:45.123456",
       "created_at": "2026-02-15T10:30:45.123456"
     }
